@@ -29,12 +29,15 @@ stateDiagram-v2
     merge --> work: rework (CI red, conflict, head moved)
     review --> work: rework (PR closed)
     review --> done: accept (merged by a human)
+    work --> cancelled: cancel (admin)
+    review --> cancelled: cancel (admin)
     done --> [*]
+    cancelled --> [*]
 ```
 
 | Field | Meaning |
 |---|---|
-| `need` | `work`, `review`, `merge` or `done` |
+| `need` | `work`, `review`, `merge`, `done` or `cancelled` |
 | `epoch` | Fencing token. Every claim bumps it. It never decreases. |
 | `lease` | Current holder, or null. Only `work` and `review` can be leased. |
 | `pr` | Latest PR. Survives failed attempts, so the next worker resumes from it. |
@@ -54,6 +57,7 @@ stateDiagram-v2
 | `expire(e)` | admin | leased, `epoch = e` | `strikes += 1`, lease released |
 | `accept` | admin | `need` is `review` or `merge` | `need := done` |
 | `rework` | admin | `need` is `review` or `merge` | `need := work`, lease released |
+| `cancel` | admin | `need` is `work` or `review`, leased or not | `need := cancelled`, lease released (the holder's next heartbeat fails) |
 
 ### What is proved
 
@@ -66,9 +70,10 @@ stateDiagram-v2
 | A failed or expired attempt changes nothing but the lease and the strike count | `failure_harmless`, `expire_harmless` |
 | An unleased task needing work is claimable by anyone, whatever its history | `work_always_claimable` |
 | Only a reviewer's "changes" or the admin's "rework" can move a task backwards; failures cannot | `regress_only_by_verdict` |
-| From every state there is a continuation through the normal path that reaches `done` | `no_dead_end` |
-| Every non-done task has an enabled event; any lease can be released | `never_stuck`, `lease_always_releasable` |
-| `done` is final | `done_final` |
+| Cancelling a task fences its lease holder: its heartbeat, report and review are rejected from then on | `cancel_fenced` |
+| From every state except `cancelled` there is a continuation through the normal path that reaches `done` | `no_dead_end` |
+| Every task that is not `done` or `cancelled` has an enabled event; any lease can be released | `never_stuck`, `lease_always_releasable` |
+| `done` and `cancelled` are final | `terminal_final`, `done_final` |
 | A write decided on a stale read is rejected | `Log.stale_rejected` |
 | A write that succeeds is a legal step of the current state, not of the stale one | `Log.submit_is_step` |
 | Racing writers on one snapshot: one wins | `Log.one_winner` |
@@ -147,6 +152,7 @@ Event to operation:
 | `accept` | push commit | `POST /admin/task-accepted` `{task, pr, merged_sha}` |
 | `rework` | push commit | `POST /admin/task-rework` `{task, reason, detail}` (not in your list) |
 | `expire` | push commit | `POST /admin/task-expire` `{task, epoch}` (not in your list) |
+| `cancel` | push commit, then a `cancelled/<task-id>.json` record and branch deletion | `POST /admin/task-cancelled` `{task}`; removing a task from the tree also cancels it |
 
 ### GitHub specifics
 
@@ -160,6 +166,9 @@ Event to operation:
   | never claimed | none | the task in the config tree |
   | claimed, in progress, partial, in review, awaiting merge | `task-lock/<task-id>`; `lease` set while someone works on it | `status.json` at the branch tip |
   | accepted | deleted after a grace period | `done/<task-id>.json` in the config repo, plus the `archive` branch |
+  | cancelled | deleted after a grace period (at once if the task left the tree) | `cancelled/<task-id>.json`, plus the `archive` branch |
+
+  A cancelled task is never claimed again, but unlike a done one it does not satisfy other tasks' dependencies. The post-claim re-check below looks for either record.
 
 - **Retiring a branch**, in this order, each step idempotent:
   1. `accept` is committed on the lock branch (`need = done`; no further event is legal, `done_final`).
@@ -231,7 +240,7 @@ A stronger version would make the claim itself carry `spec` and reject a mismatc
 
 **Selection** is random within a priority order: review, fix after "changes", continue a partial, new work. Random choice makes collisions rare; CAS makes them harmless.
 
-**Attempt journal.** `~/.local/state/afe-fleet/<fleet>/attempt.json`, written atomically before each side effect:
+**Attempt journal.** `~/.local/share/afe-fleet/fleets/<fleet>/journal-<slot>.json`, written atomically before each side effect:
 `claimed → prepared → agent_started(session_id) → agent_finished → pushed(sha) → pr(number) → reported`.
 On start the worker reads it and asks the backend whether the lease is still its own (same worker, epoch and nonce).
 
@@ -244,24 +253,29 @@ On start the worker reads it and asks the backend whether the lease is still its
 **Every external side effect has a deterministic key and is read back before retry.**
 Work branch name `task/<task-id>/e<epoch>`; PR found by head branch before creating; review comments carry `<!-- afe-fleet task=… epoch=… sha=… -->`.
 
-**Container.** One per attempt, named `afe-fleet-<fleet>-<slot>`, labelled so strays can be found.
+**Where the agent runs.** For now, directly on the worker's machine, as the worker's user, with the user's `HOME`: the agent CLI uses the operator's normal login (`claude auth login`, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`). Running in containers is deferred; the `docker` runtime in `agent.py` is kept but not used. What this costs:
+
+- The agent can do anything the user can, including reading the worker's GitHub credential. Use a dedicated machine or user account for workers.
+- There is no network restriction and no resource limit per agent. Killing an agent kills its process group; children that leave the group (daemons, `setsid`) can survive it.
+
+**Checkouts: one shared clone per repository, one worktree per attempt.**
 
 ```
-docker run --rm -i --name afe-fleet-$FLEET-$SLOT --label afe-fleet.name=$FLEET \
-  --user $(id -u):$(id -g) --cap-drop ALL --security-opt no-new-privileges \
-  --memory 16g --cpus 8 --pids-limit 4096 --network afe-fleet-egress \
-  -v $ATTEMPT/work:/work  -v $ATTEMPT/task:/task:ro  -v $ATTEMPT/out:/out \
-  -v $ATTEMPT/home:/home/agent \
-  -v $HOME/.claude/.credentials.json:/auth/claude.json:ro \
-  $IMAGE@sha256:… \
-  claude -p --input-format stream-json --output-format stream-json --verbose \
-         --dangerously-skip-permissions --session-id $UUID
+~/.local/share/afe-fleet/repos/<repo>-<hash>.git    bare clone, remote origin, refs/remotes/origin/*
+~/.local/share/afe-fleet/repos/<repo>-<hash>.lock   flock(2), exclusive
+~/.local/share/afe-fleet/fleets/<fleet>/attempts/<task>-e<epoch>/
+    work/   git worktree of the shared clone, on local branch afe/<fleet>/<task>/e<epoch>
+    task/   TASK.md, task.json        out/   result.json or review.json
 ```
 
-- The agent gets model credentials and nothing else. **No GitHub token enters the container.** The worker pushes, opens the PR and posts the review.
-- The image comes from the task's `project.toml` (below), pinned by digest.
-- Agent contract: read `/task/TASK.md` and `/task/task.json`; work in `/work`; commit; write `/out/result.json` (`outcome`, `summary`, `progress`, `debug`, `followups[]`) or `/out/review.json` (`verdict`, `summary`, `comments[]`).
-- The per-attempt writable home keeps the agent's session files, which is what makes `--resume` work after a worker crash.
+- Everything afe-fleet keeps on a machine is under `~/.local/share/afe-fleet/` (`$AFE_FLEET_HOME` overrides it): `repos/` (shared clones), `mirrors/` (config-repo mirrors), and `fleets/<fleet>/` (lock-repo mirrors, journals, attempts with their worktrees, the server database). Only the per-host config stays in `~/.config/afe-fleet/<fleet>.toml`, and systemd units in `~/.config/systemd/user/`. Nothing goes in `~/.cache`: a worktree's commits are stored in the shared clone's object store, so treating it as a cache would lose unpushed work.
+- Every slot of every afe-fleet process on the machine, in any fleet, shares the clone for a given URL: one fetch serves them all and a new attempt costs a worktree, not a clone.
+- Fetching, adding and removing worktrees, and deleting branches and refs hold the file lock, which works across threads and processes. Work inside a worktree takes no lock: each has its own index, HEAD and branch.
+- Local branches and temporary refs (`refs/afe/<fleet>/<task>/e<epoch>/prev` for the previous PR, `.../pr` for a review) are namespaced per attempt and removed with the worktree. The branch pushed for the PR is `task/<task-id>/e<epoch>` regardless of the local name.
+- Automatic `gc` and maintenance are off in the shared clone: repacking under agents committing in other worktrees is the main way to corrupt it. A crashed attempt leaves a directory behind; the next `worktree add` prunes it.
+- Agents can see each other's worktrees through `git worktree list` and could damage the shared clone; that is accepted on a dedicated machine.
+
+- Agent contract: read `TASK.md` and `task.json` from the task directory named in the prompt; work in the worktree (the current directory); commit; write `result.json` in the output directory named in the prompt (`outcome`, `summary`, `progress`, `debug`, `followups[]`) or `/out/review.json` (`verdict`, `summary`, `comments[]`).
 
 **Agent supervisor.** The worker owns the JSONL pipe.
 
@@ -289,7 +303,14 @@ docker run --rm -i --name afe-fleet-$FLEET-$SLOT --label afe-fleet.name=$FLEET \
 1. Snapshot the workspace with a temporary index (`GIT_INDEX_FILE`), so the agent's own index and HEAD are untouched, and push it to the work branch `task/<task-id>/e<epoch>` on the worker's fork.
 2. `submit(heartbeat)` with a one-line note and the checkpoint SHA.
 
-`Lost` → kill the container at once. `Unknown` → keep working and keep retrying.
+Heartbeat failures come in two kinds, and the worker treats them differently:
+
+| Failure | Raised as | Examples | Worker |
+|---|---|---|---|
+| Lease failure | `Fenced` | the lock branch moved (expired, cancelled, taken over), the branch was deleted, the server answers 409 | kill the container at once and stop; no report |
+| Connectivity failure | `Unreachable` | `git push`/`ls-remote` fail, the server cannot be reached or answers 5xx; whether the write landed is unknown | keep working, retry the heartbeat sooner, log how long it has been unreachable |
+
+The final update (report or review) retries `Unreachable` with exponential backoff (5 s doubling to 5 minutes, for up to an hour). Every retry is idempotent: on GitHub it re-pushes the *same* commit, so a push whose reply was lost reads back as success; on the server it re-sends the same request id, and the server replays its first answer. Only `Fenced` ends the attempt without a report. The heartbeat thread and the report are serialized per lease, so a heartbeat landing just before the report cannot make the report look like a lost lease.
 Because the checkpoint is pushed before the heartbeat, a host that dies loses at most five minutes of work and the next claimant starts from that branch.
 
 **Work across workers.** A continuation by the same GitHub user pushes to the same PR branch with `--force-with-lease=<branch>:<observed head>`. A different user branches from the previous head, opens a new PR, and the report replaces `pr`; the admin closes the superseded one.
@@ -363,7 +384,9 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 
 | Observed | Action |
 |---|---|
-| Lock branch for a task id that is not in the tree | delete it (this also fences a holder) |
+| Lock branch for a task id that is not in the tree | `cancel` (fences a holder), archive, delete |
+| `need = cancelled`, no `cancelled/<task-id>.json` | write it, archive; delete the branch after the grace period |
+| `afe-fleet admin cancel <task> [--remove]` | `cancel`, record it, and with `--remove` delete `tasks/<task-id>/` from the tree |
 | Leased, tip unchanged for TTL across my own successful polls | `expire` |
 | Leased, and the lease's `spec` differs from the task's current content hash | `expire` (reason `spec-changed`) |
 | `need` is `review` or `merge`, and `pr.spec` differs from the current content hash | `rework` (reason `spec-changed`) |
@@ -448,7 +471,8 @@ Even then, any grantee can write any task's status. The audit catches illegal tr
 | Access invitation not accepted within 7 days | Admin sweep sees `expired` | Re-invite, at most 3 times, then close the issue |
 | Over 50 invitations in a day | `PUT` fails | Issues stay open; later sweeps continue |
 | PR closed by a human | Admin sweep | `rework` |
-| Task deleted from the tree | Admin sync | Close its PR, delete the lock branch; the holder's next push is rejected |
+| Task deleted from the tree | Admin sync | `cancel`, then delete the lock branch; the holder's next heartbeat is rejected (git test F4) |
+| Coordination unreachable mid-attempt | Heartbeat raises `Unreachable` | Keep working; the final report retries with backoff and the same commit / request id |
 | Task edited while claimed, or claimed from a stale tree | Admin compares `spec` | `expire`, or `rework` if a PR exists; fenced within one sweep |
 | F1: worker read the config before a done record, claims after the branch was deleted | Worker's post-claim re-fetch of the config | Worker stops; admin deletes the recreated branch. Reproduced without the re-check, prevented with it, in `GitBackendTest` section 7 |
 | F2: zombie pushes a commit from before the deletion | `--force-with-lease` (ref no longer exists) | Rejected. A plain push would recreate the branch; both shown in `GitBackendTest` section 7 |
@@ -485,14 +509,20 @@ Even then, any grantee can write any task's status. The audit catches illegal tr
 18. **Onboarding is a write grant to anyone who asks** in `auto` mode. Section 6 lists what must be protected first; for a public repo, `approve` is the safer default.
 19. **Scale limit of GitHub mode.** Lock branches exist only for tasks in flight, so the count tracks fleet activity, not the size of the task tree. Done records are files in the config repo. Thousands of concurrent in-flight tasks would make `ls-remote` slow; that is the point to switch to the server.
 
-## 9. Size and build order
+## 9. Size and implementation status
 
-The reference project is about 200,000 lines of Python. This design should be about 3,000 to 4,000 lines in one static binary that shells out to `git`, `gh` and `docker`.
+The reference project is about 200,000 lines of Python. This one is a Python package (`src/afe_fleet`, about 3,600 lines, standard library only) that shells out to `git`, `gh` and `docker`.
 
-1. `step` in the implementation language, tested against traces generated from the Lean model.
-2. GitHub backend (`snapshot`, `submit`, `changes`) with a two-process race test.
-3. Worker with a fake agent (a script that writes `result.json`), including kill-at-every-journal-step tests.
-4. Admin reconciler, including access requests.
-5. Real agent adapter, container, verify loop.
-6. Server backend.
-7. Install, self-update, rollback.
+| Part | Module | Status |
+|---|---|---|
+| `step`, checked pair by pair against traces exported from the Lean model | `model.py`, `status.py` | done, tested |
+| GitHub backend: lock branches, CAS, audit, archive; config repo, done/cancelled records | `lockrepo.py`, `configrepo.py`, `coord.py` | done, tested on local repos |
+| Server backend: HTTP + SQLite, task tokens, TTL, idempotent requests | `server.py`, `coord.py` | done, tested |
+| Worker: claim, journal, heartbeat, agent supervisor, verify/repair loop, outcome, PR, review | `worker.py`, `agent.py` | done, tested with a fake agent and the `local` runtime |
+| Admin: expiry, spec changes, merge/rework, retire, cancel, access requests | `admin.py`, `access.py` | done, tested with a fake forge (access requests untested) |
+| Service install/uninstall, self-update | `service.py`, `update.py` | install/uninstall tested with a fake systemctl; self-update untested |
+| GitHub API (`gh`) | `forge.py` | written, **not exercised by any test** |
+| Local runtime with a real agent CLI | `agent.py` | written, **not exercised by any test** (the fake agent covers the protocol) |
+| Shared clone with a worktree per attempt, file-locked across processes | `repocache.py` | done, tested (concurrent attempts, cross-process lock, crash cleanup) |
+| Docker runtime | `agent.py` | deferred; code kept, unused |
+| Not yet: workspace checkpoints on heartbeat, resuming an agent session after a worker restart (the worker releases the lease instead), closing superseded PRs, repair commits for illegal writes, escalation labels | | |
