@@ -331,9 +331,27 @@ class Worker:
                    and not shutdown)
         push_url, owner = self.forge.push_target(proj["repo"], self.host.gh_user, self.host.push) \
             if "/" in proj["repo"] and not proj["repo"].startswith(("/", ".")) else (code_url, "")
-        p = git.run("push", "-q", f"--force-with-lease=refs/heads/{branch}:", push_url, f"HEAD:refs/heads/{branch}")
-        if p.returncode != 0 and git.run("ls-remote", "--exit-code", push_url, f"refs/heads/{branch}").returncode != 0:
-            raise GitError(["push", branch], p.returncode, p.stderr)
+        # A fix after review (or a continuation after a partial) updates the existing PR: push our
+        # commits onto the PR's own branch, wherever it lives. The lease is the head we started
+        # from, so a concurrent push there makes this fail rather than overwrite it. Only when
+        # the PR is closed or its branch cannot be pushed to do we open a new PR.
+        reuse = (start != f"refs/remotes/origin/{base}" and isinstance(prev, dict)
+                 and prev.get("repo") == proj["repo"] and prev.get("fetch") and prev.get("branch")
+                 and self._pr_open(prev))
+        if reuse:
+            p = git.run("push", "-q", f"--force-with-lease=refs/heads/{prev['branch']}:{start_sha}", prev["fetch"],
+                        f"HEAD:refs/heads/{prev['branch']}")
+            if p.returncode == 0:
+                branch, push_url = prev["branch"], prev["fetch"]
+            else:
+                log.warning("%s: cannot push to %s of PR #%s (%s); opening a new PR", lease.task, prev["branch"],
+                            prev.get("number"), p.stderr.strip()[-200:])
+                reuse = False
+        if not reuse:
+            p = git.run("push", "-q", f"--force-with-lease=refs/heads/{branch}:", push_url, f"HEAD:refs/heads/{branch}")
+            if p.returncode != 0 and git.run("ls-remote", "--exit-code", push_url,
+                                             f"refs/heads/{branch}").returncode != 0:
+                raise GitError(["push", branch], p.returncode, p.stderr)
         self.journal.write(step="pushed", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease), sha=head)
         title = f"{lease.task}: {summary.splitlines()[0][:60]}" if summary else f"afe-fleet: {lease.task}"
@@ -346,6 +364,16 @@ class Worker:
             raise GitError(["pr", branch], 1, str(e)) from e
         pr = {**pr, "head_sha": head, "spec": td.spec, "gh_user": self.host.gh_user, "branch": branch,
               "fetch": pr.get("fetch") or push_url}
+        try:
+            if reuse:
+                self.forge.comment(pr, f"Attempt {lease.epoch} by `{self.worker_id}` pushed "
+                                       f"`{head[:12]}`.\n\n{summary}\n\nVerify: {'passed' if verify.ok else 'failed'}")
+            elif isinstance(prev, dict) and prev.get("number") and prev.get("repo") == proj["repo"] \
+                    and prev.get("number") != pr.get("number") and self._pr_open(prev):
+                self.forge.close(prev, f"Superseded by {pr.get('url') or '#' + str(pr.get('number'))} "
+                                       f"(attempt {lease.epoch} of `{lease.task}`).")
+        except ForgeError as e:  # cosmetic: the admin also closes superseded PRs
+            log.warning("%s: %s", lease.task, e)
         self.journal.write(step="pr", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease), pr=pr)
         if success:
@@ -394,6 +422,13 @@ class Worker:
         log.info("%s: review %s at %s", lease.task, verdict.value, sha[:8])
 
     # -- helpers -------------------------------------------------------------------------------
+
+    def _pr_open(self, pr: dict) -> bool:
+        try:
+            return self.forge.pr_state(pr)["state"] == "open"
+        except (ForgeError, KeyError) as e:
+            log.info("cannot read PR state (%s); treating it as closed", e)
+            return False
 
     def _token(self, lease: Lease):
         return lease.handle if isinstance(self.coord, ServerCoord) else None

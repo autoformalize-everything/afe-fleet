@@ -98,6 +98,12 @@ class Admin:
         for task in list(self.t.lease):
             if task not in views:
                 self.t.lease.pop(task, None)
+        self._open_prs = {}
+        for task, v in sorted(views.items()):
+            try:
+                acts += self._superseded(v)
+            except ForgeError as e:
+                log.warning("%s: forge error: %s", task, e)
         if self.access:
             try:
                 acts += self.access.sweep()
@@ -195,6 +201,22 @@ class Admin:
             acts.append(f"{task}: recorded{' and removed from the tree' if remove else ''}")
         elif remove:
             acts.append(f"{task}: remove tasks/{task}/ from the config repo yourself (server mode)")
+        return acts
+
+    def _superseded(self, v: AdminView) -> list[str]:
+        """Close this task's open PRs older than the one its status names. Only older ones: a
+        newer PR may belong to a worker whose report has not landed yet."""
+        pr = v.status.core.pr
+        if not isinstance(pr, dict) or not pr.get("number") or not pr.get("repo"):
+            return []
+        repo = pr["repo"]
+        if repo not in self._open_prs:
+            self._open_prs[repo] = self.forge.open_prs(repo, "task/")
+        acts = []
+        for other in self._open_prs[repo]:
+            if other["branch"].startswith(f"task/{v.task}/") and other["number"] < pr["number"]:
+                self.forge.close(other, f"Superseded by {pr.get('url') or '#' + str(pr['number'])}.")
+                acts.append(f"{v.task}: closed superseded PR #{other['number']}")
         return acts
 
     def _pr(self, v: AdminView, pr: dict) -> list[str]:

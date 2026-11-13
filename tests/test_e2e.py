@@ -121,11 +121,41 @@ def test_changes_requested_then_fixed_continuing_from_the_pr(world):
     st = status(world, "demo/a")
     assert st.core.need is Need.WORK and st.rounds == 1 and st.last["outcome"] == "changes"
     first_pr = st.core.pr
-    assert a.run_once()  # continues from the previous PR branch
+    assert a.run_once()  # the fix: continues on the same PR
     st = status(world, "demo/a")
-    assert st.core.need is Need.REVIEW and st.core.pr["branch"] == f"task/demo/a/e{st.core.epoch}"
-    log = git("log", "--format=%H", st.core.pr["branch"], cwd=world.code_repo)
-    assert first_pr["head_sha"] in log
+    pr = st.core.pr
+    assert st.core.need is Need.REVIEW
+    assert pr["number"] == first_pr["number"] and pr["branch"] == first_pr["branch"] == "task/demo/a/e1"
+    assert pr["head_sha"] != first_pr["head_sha"]
+    assert git("rev-parse", "task/demo/a/e1", cwd=world.code_repo) == pr["head_sha"]
+    assert first_pr["head_sha"] in git("log", "--format=%H", "task/demo/a/e1", cwd=world.code_repo)
+    assert len(forge.prs) == 1 and forge.prs[1]["state"] == "open"
+    assert "Attempt 3" in forge.prs[1]["comments"][-1]
+    # a second round of review and fix still uses the same PR
+    assert b.run_once() and a.run_once()
+    assert len(forge.prs) == 1 and status(world, "demo/a").core.pr["number"] == 1
+
+
+def test_fix_after_the_pr_was_closed_opens_a_new_one(world):
+    forge = FakeForge()
+    a = make_worker(world, "alice", "work", forge)
+    assert a.run_once() and make_worker(world, "bob", "changes", forge).run_once()
+    forge.prs[1]["state"] = "closed"  # someone closed it by hand
+    assert a.run_once()
+    st = status(world, "demo/a")
+    assert st.core.pr["number"] == 2 and st.core.pr["branch"] == f"task/demo/a/e{st.core.epoch}"
+
+
+def test_admin_closes_older_prs_of_a_task(world):
+    forge = FakeForge()
+    a = make_worker(world, "alice", "work", forge)
+    assert a.run_once() and make_worker(world, "bob", "changes", forge).run_once()
+    forge.prs[1]["state"] = "closed"
+    assert a.run_once()  # PR #2
+    forge.prs[1]["state"] = "open"  # pretend #1 was reopened: the admin should close it again
+    acts = make_admin(world, forge).sweep()
+    assert "demo/a: closed superseded PR #1" in acts and forge.prs[1]["state"] == "closed"
+    assert forge.prs[2]["state"] == "open"
 
 
 def test_admin_expires_a_silent_lease_on_its_own_clock(world):

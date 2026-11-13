@@ -45,6 +45,12 @@ class Forge:
 
     def close(self, pr: dict, comment: str) -> None: ...
 
+    def comment(self, pr: dict, body: str) -> None: ...
+
+    def open_prs(self, repo: str, branch_prefix: str) -> list[dict]:
+        """Open PRs whose head branch starts with `branch_prefix`: [{"number", "branch", "url"}]."""
+        ...
+
     # access requests (lock repo)
     def open_issues(self, repo: str) -> list[dict]: ...
     def issue_comments(self, repo: str, number: int) -> list[str]: ...
@@ -147,6 +153,14 @@ class GhForge(Forge):
     def close(self, pr: dict, comment: str) -> None:
         self.api(f"repos/{pr['repo']}/issues/{pr['number']}/comments", method="POST", body={"body": comment})
         self.api(f"repos/{pr['repo']}/pulls/{pr['number']}", method="PATCH", body={"state": "closed"})
+
+    def comment(self, pr: dict, body: str) -> None:
+        self.api(f"repos/{pr['repo']}/issues/{pr['number']}/comments", method="POST", body={"body": body})
+
+    def open_prs(self, repo: str, branch_prefix: str) -> list[dict]:
+        _, items = self.api(f"repos/{repo}/pulls?state=open&per_page=100")
+        return [{"repo": repo, "number": p["number"], "branch": p["head"]["ref"], "url": p["html_url"]}
+                for p in items if p["head"]["ref"].startswith(branch_prefix)]
 
     def open_issues(self, repo: str) -> list[dict]:
         _, items = self.api(f"repos/{repo}/issues?state=open&per_page=100&sort=created&direction=asc")

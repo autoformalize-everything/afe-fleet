@@ -106,6 +106,14 @@ class FakeForge(Forge):
 
     def close(self, pr, comment):
         self.prs[pr["number"]]["state"] = "closed"
+        self.prs[pr["number"]].setdefault("comments", []).append(comment)
+
+    def comment(self, pr, body):
+        self.prs[pr["number"]].setdefault("comments", []).append(body)
+
+    def open_prs(self, repo, branch_prefix):
+        return [{"repo": repo, "number": n, "branch": p["branch"], "url": f"pr/{n}"}
+                for n, p in self.prs.items() if p["state"] == "open" and p["branch"].startswith(branch_prefix)]
 
 
 FLEET_TOML = """
