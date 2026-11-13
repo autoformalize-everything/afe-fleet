@@ -16,7 +16,7 @@ remote it is skipped and says so. `--remote-only` skips the local run.
 
 What is exercised, always with real pushes:
 
-1. **Every transition.** Seven states × every event (149 pairs). The expected result of each
+1. **Every transition.** Eight states × every event shape. The expected result of each
    pair is written out by hand below; the Lean model must agree with the table, and every
    accepted pair must land on the remote in both push modes (`--force-with-lease`, and plain
    fast-forward-only).
@@ -42,6 +42,8 @@ What is exercised, always with real pushes:
    - F2: a zombie holding a commit from before the deletion recreates the branch with a
      plain push. Guard: always push with `--force-with-lease`.
    - F3: during the grace period a late claim meets the `done` status and is denied.
+   - F4: the admin cancels a task while a worker holds it, records it and deletes the branch:
+     the holder's heartbeat is rejected before and after the deletion.
 
 An unclaimed task has no lock branch; its first claim creates it.
 -/
@@ -83,6 +85,7 @@ def expStale    := "expire, stale token"
 def expFuture   := "expire, future token"
 def accept      := "accept"
 def rework      := "rework"
+def cancel      := "cancel"
 end L
 
 /-- Every event shape, instantiated for a state with epoch `e`. `h` is the lease holder, or
@@ -112,7 +115,8 @@ def probes (t : Task) (h : Worker) : List (String × Option Event) :=
     (L.expStale,    old (.expire (e - 1))),
     (L.expFuture,   some (.expire (e + 1))),
     (L.accept,      some .accept),
-    (L.rework,      some .rework) ]
+    (L.rework,      some .rework),
+    (L.cancel,      some .cancel) ]
 
 structure St where
   name    : String
@@ -132,13 +136,15 @@ def states : Array St := #[
     task := ⟨.work, 0, none, none, none, 0⟩,
     accepts := [
       (L.claimNew, ⟨.work, 1, some 9, none, none, 0⟩),
-      (L.claim1,   ⟨.work, 1, some 1, none, none, 0⟩) ] },
+      (L.claim1,   ⟨.work, 1, some 1, none, none, 0⟩),
+      (L.cancel,   ⟨.cancelled, 0, none, none, none, 0⟩) ] },
   -- worker 3 claimed and was expired
   { name := "work", path := [.claim 3 0, .expire 1], actor := 3,
     task := ⟨.work, 1, none, none, none, 1⟩,
     accepts := [
       (L.claimNew, ⟨.work, 2, some 9, none, none, 1⟩),
-      (L.claim1,   ⟨.work, 2, some 1, none, none, 1⟩) ] },
+      (L.claim1,   ⟨.work, 2, some 1, none, none, 1⟩),
+      (L.cancel,   ⟨.cancelled, 1, none, none, none, 1⟩) ] },
   { name := "work+lease", path := [.claim 3 0, .expire 1, .claim 1 1], actor := 1,
     task := ⟨.work, 2, some 1, none, none, 1⟩,
     accepts := [
@@ -146,14 +152,16 @@ def states : Array St := #[
       (L.repS, ⟨.review, 2, none,   some 8, some 1, 1⟩),
       (L.repP, ⟨.work,   2, none,   some 8, none,   1⟩),
       (L.repF, ⟨.work,   2, none,   none,   none,   2⟩),
-      (L.exp,  ⟨.work,   2, none,   none,   none,   2⟩) ] },
+      (L.exp,  ⟨.work,   2, none,   none,   none,   2⟩),
+      (L.cancel, ⟨.cancelled, 2, none, none, none,   1⟩) ] },
   { name := "review",
     path := [.claim 3 0, .expire 1, .claim 1 1, .report 1 2 (.success 7)], actor := 1,
     task := ⟨.review, 2, none, some 7, some 1, 1⟩,
     accepts := [
       (L.claimNew, ⟨.review, 3, some 9, some 7, some 1, 1⟩),
       (L.accept,   ⟨.done,   2, none,   some 7, some 1, 1⟩),
-      (L.rework,   ⟨.work,   2, none,   some 7, some 1, 1⟩) ] },
+      (L.rework,   ⟨.work,   2, none,   some 7, some 1, 1⟩),
+      (L.cancel,   ⟨.cancelled, 2, none, some 7, some 1, 1⟩) ] },
   { name := "review+lease",
     path := [.claim 3 0, .expire 1, .claim 1 1, .report 1 2 (.success 7), .claim 2 2], actor := 2,
     task := ⟨.review, 3, some 2, some 7, some 1, 1⟩,
@@ -164,7 +172,8 @@ def states : Array St := #[
       (L.revAb,  ⟨.review, 3, none,   some 7, some 1, 1⟩),
       (L.exp,    ⟨.review, 3, none,   some 7, some 1, 2⟩),
       (L.accept, ⟨.done,   3, none,   some 7, some 1, 1⟩),
-      (L.rework, ⟨.work,   3, none,   some 7, some 1, 1⟩) ] },
+      (L.rework, ⟨.work,   3, none,   some 7, some 1, 1⟩),
+      (L.cancel, ⟨.cancelled, 3, none, some 7, some 1, 1⟩) ] },
   { name := "merge",
     path := [.claim 3 0, .expire 1, .claim 1 1, .report 1 2 (.success 7), .claim 2 2,
              .review 2 3 .approve], actor := 2,
@@ -176,6 +185,9 @@ def states : Array St := #[
     path := [.claim 3 0, .expire 1, .claim 1 1, .report 1 2 (.success 7), .claim 2 2,
              .review 2 3 .approve, .accept], actor := 2,
     task := ⟨.done, 3, none, some 7, some 1, 1⟩,
+    accepts := [] },
+  { name := "cancelled", path := [.claim 3 0, .expire 1, .cancel], actor := 3,
+    task := ⟨.cancelled, 1, none, none, none, 1⟩,
     accepts := [] } ]
 
 /-- One (state, event) pair. -/
@@ -209,6 +221,7 @@ def tipOf (tips : Array (String × String)) (task : String) : Option String :=
 
 def needName : Need → String
   | .work => "work" | .review => "review" | .merge => "merge" | .done => "done"
+  | .cancelled => "cancelled"
 
 def pad (s : String) (n : Nat) : String := s ++ String.ofList (List.replicate (n - s.length) ' ')
 
@@ -515,7 +528,8 @@ def Git.Client.hasDone (c : Client) (rev : Option String) (task : String) : IO B
   return (← c.run #["cat-file", "-e", s!"{rev}:done/{task}.json"]).exitCode == 0
 
 /-- Admin: commit `done/<task>.json` to the config repo's `main`, compare-and-swap on `main`. -/
-def Git.Client.writeDone (c : Client) (cfg task : String) (status : Task) (lockTip : String) : IO Unit := do
+def Git.Client.writeDone (c : Client) (cfg task : String) (status : Task) (lockTip : String)
+    (dir : String := "done") : IO Unit := do
   let parent ← c.fetchCfg cfg
   let ix : Client := { c with env := c.env.push ("GIT_INDEX_FILE", some (c.dir / "cfg-index").toString) }
   match parent with
@@ -523,7 +537,7 @@ def Git.Client.writeDone (c : Client) (cfg task : String) (status : Task) (lockT
   | none => discard <| ix.git #["read-tree", "--empty"]
   let body := Json.mkObj [("status", toJson status), ("lock_tip", lockTip)]
   let blob ← ix.git #["hash-object", "-w", "--stdin"] (some (body.pretty ++ "\n"))
-  discard <| ix.git #["update-index", "--add", "--cacheinfo", s!"100644,{blob},done/{task}.json"]
+  discard <| ix.git #["update-index", "--add", "--cacheinfo", s!"100644,{blob},{dir}/{task}.json"]
   let tree ← ix.git #["write-tree"]
   let ps := match parent with | some p => #["-p", p] | none => #[]
   let commit ← ix.git (#["commit-tree", tree] ++ ps ++ #["-m", s!"done: {task}"])
@@ -629,8 +643,31 @@ def retiring (x : Ctx) : IO Unit := do
     lines := lines.push ("F3 late claim during the grace period: denied by the rules", "prevented")
     adminDelete x task
 
+  -- F4: the admin cancels a task while a worker holds the lease, records it, deletes the branch
+  do
+    let task := "retire/f4"
+    let w1 := who[1]!
+    let s₀ ← w1.read task
+    x.tally.check ((← w1.submit .lease task s₀ (.claim 1 0)) matches .won _) s!"{task}: w1 claims"
+    let held ← w1.read task
+    let seen ← admin.read task
+    x.tally.check ((← admin.submit .lease task seen .cancel) matches .won _) s!"{task}: admin cancels"
+    x.tally.check ((← w1.submit .lease task held (.heartbeat 1 1)) == .lost)
+      s!"{task}: w1's heartbeat after the cancel is rejected by git"
+    let now ← w1.read task
+    x.tally.check ((← w1.submit .lease task now (.heartbeat 1 1)) == .denied)
+      s!"{task}: after re-reading, the heartbeat is denied by the rules"
+    let tip ← (← tipOfTask task).getDM (throw <| IO.userError "no tip")
+    admin.writeDone x.cfg task now.val tip (dir := "cancelled")
+    adminDelete x task
+    x.tally.check ((← w1.submit .lease task held (.heartbeat 1 1)) == .lost)
+      s!"{task}: w1's heartbeat after the deletion is rejected by git"
+    x.tally.check ((← tipOfTask task).isNone) s!"{task}: the branch stays deleted"
+    lines := lines.push ("F4 cancel while leased: the holder's heartbeat fails, before and after deletion",
+      "prevented")
+
   for (what, verdict) in lines do
-    IO.println s!"   {pad what 76}{verdict}"
+    IO.println s!"   {pad what 82}{verdict}"
 
 def cleanup (x : Ctx) : IO Unit := do
   if !x.isLocal then

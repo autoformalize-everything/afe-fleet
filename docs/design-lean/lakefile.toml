@@ -11,3 +11,7 @@ name = "GitBackend"
 [[lean_exe]]
 name = "git_backend_test"
 root = "GitBackendTest"
+
+[[lean_exe]]
+name = "export_step"
+root = "ExportStep"

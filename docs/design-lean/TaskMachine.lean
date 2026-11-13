@@ -6,7 +6,8 @@ Core Lean 4 only (no Mathlib). Check with `lean TaskMachine.lean`.
 Two layers:
 
 * **Layer 1 — `step`**: the per-task state machine. A task is described by what it
-  *needs next* (`work → review → merge → done`) plus an optional *lease*.
+  *needs next* (`work → review → merge → done`) plus an optional *lease*. The admin can
+  withdraw a task from `work` or `review` (`cancelled`).
   There is no `failed` state: a failed attempt only releases the lease.
 * **Layer 2 — `Log`**: the only thing a coordination backend has to provide — a
   per-task append-only log with compare-and-swap on its tip.
@@ -23,9 +24,10 @@ What is proved (all names below are theorems in this file):
 | retrying any event is rejected or a no-op            | `retry_safe`                    |
 | a failed/expired attempt leaves the task claimable   | `failure_harmless`, `expire_harmless`, `work_always_claimable` |
 | only a reviewer verdict or the admin can move a task backwards | `regress_only_by_verdict` |
-| no dead ends: `done` is reachable from every state   | `no_dead_end`                   |
+| cancelling a task fences its lease holder            | `cancel_fenced`                 |
+| no dead ends: `done` is reachable from every state but `cancelled` | `no_dead_end`     |
 | nothing is ever stuck: some event is always enabled  | `never_stuck`                   |
-| `done` is final                                      | `done_final`                    |
+| `done` and `cancelled` are final                     | `terminal_final`, `done_final`  |
 | a write decided on a stale snapshot is rejected      | `Log.stale_rejected`            |
 | a successful write is a legal step of the *current* state | `Log.submit_is_step`       |
 | racing writers on one snapshot: exactly one wins     | `Log.one_winner`                |
@@ -47,6 +49,7 @@ inductive Need where
   | review  -- has a PR; needs a reviewer
   | merge   -- approved; needs the admin to merge once CI is green
   | done    -- merged
+  | cancelled -- withdrawn by the admin (removed from the tree, or closed by hand)
   deriving DecidableEq, Repr
 
 structure Task where
@@ -93,6 +96,9 @@ inductive Event where
   | accept
   /-- Admin: CI red, merge conflict, PR closed, or head moved after approval. -/
   | rework
+  /-- Admin: withdraw the task. Allowed from `work` and `review`, leased or not; it ends any
+  lease, so the holder's next heartbeat is rejected. -/
+  | cancel
   deriving DecidableEq, Repr
 
 def Task.claimable (t : Task) (w : Worker) : Prop :=
@@ -136,6 +142,9 @@ def step (t : Task) : Event → Option Task
   | .rework =>
     if t.need = .review ∨ t.need = .merge then some { t with need := .work, lease := none }
     else none
+  | .cancel =>
+    if t.need = .work ∨ t.need = .review then some { t with need := .cancelled, lease := none }
+    else none
 
 /-- Run a sequence of events; `none` if any of them is rejected. -/
 def run (t : Task) : List Event → Option Task
@@ -164,7 +173,7 @@ def Reachable (t : Task) : Prop := ∃ evs, run Task.init evs = some t
 /-- Well-formedness: only `work`/`review` can be leased, and everything past `work` has a PR. -/
 def WF (t : Task) : Prop :=
   (t.lease ≠ none → t.need = .work ∨ t.need = .review) ∧
-  (t.need ≠ .work → t.pr ≠ none ∧ t.author ≠ none)
+  (t.need = .review ∨ t.need = .merge ∨ t.need = .done → t.pr ≠ none ∧ t.author ≠ none)
 
 theorem init_wf : WF Task.init := by simp [WF, Task.init]
 
@@ -263,6 +272,20 @@ theorem zombie_fenced {t t₁ t₂ : Task} {e : Nat} {evs : List Event}
     (∀ v, step t₂ (.review w e v) = none) :=
   dead_rejects (dead_run (lease_end_dead.1 hx) hr) w
 
+/-- **Cancelling fences the holder.** After the admin cancels a task, the holder of the lease
+that was current (token `t.epoch`) can never heartbeat, report or review again: its heartbeat
+fails, and the worker stops. -/
+theorem cancel_fenced {t t₁ t₂ : Task} {evs : List Event}
+    (hx : step t .cancel = some t₁) (hr : run t₁ evs = some t₂) (w : Worker) :
+    step t₂ (.heartbeat w t.epoch) = none ∧
+    (∀ o, step t₂ (.report w t.epoch o) = none) ∧
+    (∀ v, step t₂ (.review w t.epoch v) = none) := by
+  have hd : Dead t.epoch t₁ := by
+    simp only [step] at hx; split at hx
+    · injection hx with hx; subst hx; simp [Dead]
+    · contradiction
+  exact dead_rejects (dead_run hd hr) w
+
 /-- **Mutual exclusion of claims.** Two workers that saw the same state race to claim:
 whoever applies second is rejected. -/
 theorem claim_exclusive {t t₁ : Task} {w₁ w₂ : Worker} {e : Nat}
@@ -319,7 +342,7 @@ theorem review_claimable {t : Task} (hn : t.need = .review) (hl : t.lease = none
   simp [step, hn, hl, Task.claimable, hw]
 
 def Need.rank : Need → Nat
-  | .work => 3 | .review => 2 | .merge => 1 | .done => 0
+  | .work => 3 | .review => 2 | .merge => 1 | .done => 0 | .cancelled => 0
 
 /-- **No failure can move a task backwards.** The distance to `done` only ever grows by an
 explicit judgement: a reviewer requesting changes, or the admin sending it back (`rework`).
@@ -331,6 +354,16 @@ theorem regress_only_by_verdict {t t' : Task} {ev : Event} (hs : step t ev = som
   all_goals first
     | contradiction
     | (injection hs with hs; subst hs; simp_all [Need.rank])
+
+/-- `done` and `cancelled` are final. -/
+theorem terminal_final {t : Task} (h : WF t) (hd : t.need = .done ∨ t.need = .cancelled) (ev : Event) :
+    step t ev = none := by
+  obtain ⟨h₁, _⟩ := h
+  have hl : t.lease = none := by
+    cases hl : t.lease with
+    | none => rfl
+    | some w => have := h₁ (by simp [hl]); rcases hd with hd | hd <;> simp_all
+  rcases hd with hd | hd <;> cases ev <;> simp [step, hd, hl, Task.claimable]
 
 /-- `done` is final. -/
 theorem done_final {t : Task} (h : WF t) (hd : t.need = .done) (ev : Event) :
@@ -368,9 +401,10 @@ private theorem review_to_done {t : Task} (h : WF t) (hn : t.need = .review) :
 /-- **No dead ends.** From every well-formed state — whatever mixture of failures, expiries,
 rejected reviews and reworks led there — there is a continuation that reaches `done`
 through the normal path (claim, report, review, merge). -/
-theorem no_dead_end {t : Task} (h : WF t) :
+theorem no_dead_end {t : Task} (h : WF t) (hc : t.need ≠ .cancelled) :
     ∃ evs t', run t evs = some t' ∧ t'.need = .done := by
   cases hn : t.need with
+  | cancelled => exact absurd hn hc
   | done => exact ⟨[], t, rfl, hn⟩
   | merge => let ⟨t', h'⟩ := merge_to_done hn; exact ⟨_, t', h'⟩
   | review => exact review_to_done h hn
@@ -390,8 +424,9 @@ theorem no_dead_end {t : Task} (h : WF t) :
 
 /-- **Never stuck.** Every task that is not `done` has an enabled event. In particular a
 leased task can always be released (`expire`), so no lock can be held forever. -/
-theorem never_stuck {t : Task} (h : WF t) (hn : t.need ≠ .done) : ∃ ev t', step t ev = some t' := by
-  obtain ⟨evs, t', hr, hd⟩ := no_dead_end h
+theorem never_stuck {t : Task} (h : WF t) (hn : t.need ≠ .done) (hc : t.need ≠ .cancelled) :
+    ∃ ev t', step t ev = some t' := by
+  obtain ⟨evs, t', hr, hd⟩ := no_dead_end h hc
   cases evs with
   | nil => simp [run] at hr; subst hr; exact absurd hd hn
   | cons ev evs => obtain ⟨m, hm, _⟩ := run_cons_some hr; exact ⟨ev, m, hm⟩
@@ -524,6 +559,13 @@ example : (run Task.init
      .claim 2 7, .report 2 8 (.success 8),
      .claim 3 8, .review 3 9 .approve,
      .accept]).map (·.need) = some .done := by decide
+
+/-- Cancelling a leased task: the holder's heartbeat and report are rejected afterwards. -/
+example : run Task.init [.claim 1 0, .cancel, .heartbeat 1 1] = none := by decide
+example : (run Task.init [.claim 1 0, .report 1 1 (.success 7), .claim 2 1, .cancel]).map (·.need)
+    = some .cancelled := by decide
+example : run Task.init [.claim 1 0, .report 1 1 (.success 7), .claim 2 1, .review 2 2 .approve, .cancel]
+    = none := by decide
 
 /-- The author cannot review their own PR. -/
 example : run Task.init [.claim 1 0, .report 1 1 (.success 7), .claim 1 1] = none := by decide
