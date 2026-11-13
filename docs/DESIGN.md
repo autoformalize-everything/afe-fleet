@@ -1,12 +1,12 @@
 # afe-fleet: coordination design
 
 One binary, `afe-fleet`, with three roles: `afe-fleet worker`, `afe-fleet admin`, `afe-fleet server`.
-The formal model is in [`TaskMachine.lean`](TaskMachine.lean); it type-checks with `lean TaskMachine.lean` (Lean 4.35, core only, no `sorry`).
+The formal model is in [`design-lean/TaskMachine.lean`](design-lean/TaskMachine.lean); it type-checks with `lean TaskMachine.lean` from `docs/design-lean/` (Lean 4.35, core only, no `sorry`). [`design-lean/GitBackendTest.lean`](design-lean/GitBackendTest.lean) runs every transition and every denied update against a real git remote.
 
 ## 1. The whole design in one paragraph
 
 Every task has one small JSON document, `status.json`, and the only thing a coordination backend must provide is **compare-and-swap on that document**.
-On GitHub the document is the tip of the branch `task-lock/<task-id>` and CAS is a fast-forward push.
+On GitHub the document is the tip of the task's lock branch, `task-lock/<task-id>`, and CAS is a fast-forward push.
 On the server it is a row with a `rev` column and CAS is `UPDATE … WHERE rev = ?`.
 Workers and the admin never talk to each other; each one reads a status, computes the next status with one pure function (`step`, 40 lines, specified in Lean), and tries to CAS it in.
 A rejected CAS means someone else moved first: re-read and decide again.
@@ -128,15 +128,15 @@ changes(since)             -> events after a cursor
 
 | | GitHub | Server |
 |---|---|---|
-| Storage | Branch `task-lock/<id>` in the lock repo; tree is exactly one file, `status.json` | `tasks(id, rev, status)` and `events(seq, task, rev, event, at)` in SQLite |
+| Storage | Lock branch `task-lock/<task-id>` in the lock repo; its tree is exactly one file, `status.json` | `tasks(id, rev, status)` and `events(seq, task, rev, event, at)` in SQLite |
 | `rev` | Tip commit SHA | Integer |
 | `snapshot()` | `git fetch lock '+refs/heads/task-lock/*:refs/remotes/lock/*'`, then `git cat-file --batch`. One round trip, incremental, not counted against the REST rate limit. | `GET /tasks` |
-| `submit` | Build a commit with parent = `rev` using plumbing (`hash-object`, `mktree`, `commit-tree`), then `git push --force-with-lease=<ref>:<rev> lock <commit>:<ref>` | See endpoints below; the server runs `step` inside one transaction |
+| `submit` | Build a commit with parent = `rev` using plumbing (`hash-object`, `mktree`, `commit-tree`), then `git push --force-with-lease=<ref>:<rev> lock <commit>:<ref>`, where `<ref>` is `refs/heads/task-lock/<task-id>` | See endpoints below; the server runs `step` inside one transaction |
 | `Lost` | Push rejected (stale info, non-fast-forward, "reference already exists") | HTTP 409 with the current status |
-| `changes()` | `git ls-remote` every 20 s, diff against the last map, walk `old..new` on changed refs. Each commit is one event, so nothing is missed after downtime. | `GET /admin/events?after=<seq>` (long-poll) |
+| `changes()` | `git ls-remote lock 'refs/heads/task-lock/*'` every 20 s, diff against the last map, walk `old..new` on changed lock branches. Each commit is one event, so nothing is missed after downtime. | `GET /admin/events?after=<seq>` (long-poll) |
 | Who runs `step` | The client; the admin audits every new commit and repairs illegal ones | The server; illegal events get 409 |
 | Lease expiry | Admin: "tip unchanged for TTL across my own successful polls" | Same rule, same code |
-| Publish a task | Admin creates the branch with an empty expected value (create-only) | `PUT /admin/tasks` |
+| Publish a task | Admin creates the lock branch with an empty expected value (create-only) | `PUT /admin/tasks` |
 
 Event to operation:
 
@@ -150,11 +150,11 @@ Event to operation:
 
 ### GitHub specifics
 
-- **One ref, not two.** You listed both `refs/lock/<id>` and a `task-lock/<id>` branch. I merged them: the branch tip is the lock. Two refs need two writes, and there is a window where they disagree.
+- **One ref per task.** The lock branch `task-lock/<task-id>` (full name `refs/heads/task-lock/<task-id>`) is the only coordination ref a task has. Its tip is both the lock and the status. There is no separate `refs/lock/<task-id>`: a second ref would need a second write, and there would be a window where the two disagree.
 - Task ids are tree paths. Only leaves are tasks, so `task-lock/a` and `task-lock/a/b` never both exist (git cannot store both).
-- The admin pre-creates every lock branch when a task is published. Workers only ever fast-forward an existing ref, which removes the create race the reference project had to special-case.
+- The admin pre-creates every lock branch when a task is published. Workers only ever fast-forward an existing lock branch, which removes the create race the reference project had to special-case.
 - A ruleset on `task-lock/**` blocks deletion and non-fast-forward for everyone but the admin identity.
-- The lock repo can be separate from the code repo, so workers need push access to locks but only fork-and-PR access to code.
+- The lock repo can be separate from the code repo, so workers need push access to lock branches but only fork-and-PR access to code.
 - Trust model: anyone with push access to the lock repo can write any status. This mode is cooperative. The merge itself does not trust `status.json`; see section 6.
 
 ## 5. Worker
@@ -182,7 +182,7 @@ On start the worker reads it and asks the backend whether the lease is still its
 | `agent_finished`, `pushed`, `pr` | continue from that step; every step is idempotent | if the task is still unleased, re-claim and report; else leave the PR for the admin to close |
 
 **Every external side effect has a deterministic key and is read back before retry.**
-Branch name `task/<id>/e<epoch>`; PR found by head branch before creating; review comments carry `<!-- afe-fleet task=… epoch=… sha=… -->`.
+Work branch name `task/<task-id>/e<epoch>`; PR found by head branch before creating; review comments carry `<!-- afe-fleet task=… epoch=… sha=… -->`.
 
 **Container.** One per attempt, named `afe-fleet-<fleet>-<slot>`, labelled so strays can be found.
 
@@ -226,7 +226,7 @@ docker run --rm -i --name afe-fleet-$FLEET-$SLOT --label afe-fleet.name=$FLEET \
 
 **Heartbeat.** A separate thread, every 5 minutes (TTL 20 minutes):
 
-1. Snapshot the workspace with a temporary index (`GIT_INDEX_FILE`), so the agent's own index and HEAD are untouched, and push it to `task/<id>/e<epoch>` on the worker's fork.
+1. Snapshot the workspace with a temporary index (`GIT_INDEX_FILE`), so the agent's own index and HEAD are untouched, and push it to the work branch `task/<task-id>/e<epoch>` on the worker's fork.
 2. `submit(heartbeat)` with a one-line note and the checkpoint SHA.
 
 `Lost` → kill the container at once. `Unknown` → keep working and keep retrying.
@@ -314,7 +314,7 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 - The merge does not trust `status.json` alone. It also requires what GitHub itself authenticates: the PR exists, its head is the reviewed SHA, and CI is green on that SHA.
 - After a polling gap longer than one heartbeat interval (admin restart, GitHub outage), all TTL timers restart. Otherwise an outage would expire every lease at once.
 - If a project's base branch goes red after a merge, the admin stops merging into that project and publishes a top-priority `fix-main` task under it.
-- Only the admin reads PR and CI state. Workers read only lock refs. Reads do not grow with fleet size, which is the wall the reference project hit (about 526 REST calls per worker per hour).
+- Only the admin reads PR and CI state. Workers read only lock branches. Reads do not grow with fleet size, which is the wall the reference project hit (about 526 REST calls per worker per hour).
 
 ## 7. Failure matrix
 
@@ -348,9 +348,9 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 
 ## 8. What you were missing
 
-1. **A fencing token.** A lock with a TTL is not safe by itself: a slow worker whose lease expired will still push. Every write must be a CAS, and the merge must be pinned to the reviewed SHA.
+1. **A fencing token.** A lock with a TTL is not safe by itself: a slow worker whose lease expired will still push. So every status write is a CAS. In GitHub mode the fast-forward push with `--force-with-lease` is that CAS and the tip SHA is the token: expiry is itself a commit, so the old holder's next push is no longer a fast-forward and is rejected. No lock has to outlive its lease. In server mode `epoch` plays the same role. The CAS covers only the lock branch, so the merge is separately pinned to the reviewed SHA.
 2. **A trusted clock in GitHub mode.** There is none. The reference project compares lease timestamps against each host's local clock. Here only the admin expires leases, by its own observation.
-3. **Two refs for one lock.** Merged into one (section 4).
+3. **A single ref per task.** A lock ref next to a status branch is two writes that can disagree. The lock branch tip is both (section 4).
 4. **Admin endpoints for going backwards and for expiry.** `/admin/task-accepted` alone cannot express "CI is red, send it back". Add `task-rework`, `task-expire`, and `PUT /admin/tasks` to publish.
 5. **Tasks no agent can finish, and workers that fail everything.** "None of the tasks can fail" needs the escalation ladder and the worker circuit breaker, or the fleet spends without bound.
 6. **Review livelock.** Author and reviewer can alternate forever. Count rounds and escalate.

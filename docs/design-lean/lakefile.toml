@@ -1,0 +1,13 @@
+name = "afe-fleet"
+defaultTargets = ["TaskMachine", "GitBackend"]
+testDriver = "git_backend_test"
+
+[[lean_lib]]
+name = "TaskMachine"
+
+[[lean_lib]]
+name = "GitBackend"
+
+[[lean_exe]]
+name = "git_backend_test"
+root = "GitBackendTest"

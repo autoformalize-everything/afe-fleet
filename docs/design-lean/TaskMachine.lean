@@ -10,7 +10,7 @@ Two layers:
   There is no `failed` state: a failed attempt only releases the lease.
 * **Layer 2 — `Log`**: the only thing a coordination backend has to provide — a
   per-task append-only log with compare-and-swap on its tip.
-  GitHub backend: the branch `task-lock/<id>`, CAS = fast-forward push.
+  GitHub backend: the lock branch `task-lock/<task-id>`, CAS = fast-forward push.
   Server backend: a row with a `rev` column, CAS = `UPDATE … WHERE rev = ?`.
 
 What is proved (all names below are theorems in this file):
@@ -402,7 +402,7 @@ theorem lease_always_releasable {t : Task} (hl : t.lease ≠ none) :
 
 /-! ## Layer 2: the backend is a compare-and-swap log -/
 
-/-- Per-task storage. GitHub: the commit chain of `task-lock/<id>` (each commit's tree is one
+/-- Per-task storage. GitHub: the commit chain of `task-lock/<task-id>` (each commit's tree is one
 `status.json`). Server: the task row plus its rows in the `events` table. -/
 structure Log where
   tip  : Task
