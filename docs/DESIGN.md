@@ -179,14 +179,16 @@ Event to operation:
 - In the formal model, a missing branch is the empty log (`Log.Run.init`, revision 0), and one branch's life is one `Log.Run` ending in `done`, so the proofs are unchanged. Deletion and the done record are outside the per-task model; the done record is what keeps a task's life from starting again.
 - A lock branch whose name is not a task in the tree is ignored by workers. The admin deletes it (it bypasses the deletion rule).
 - **The lock repo is a repository of its own** (`autoformalize-everything/fleet-coord`), separate from the config repo (`fleet.toml` and the task tree) and from the code repos. It holds nothing but a default branch with a README, the lock branches, and the access-request issues. Workers get push access to it and nothing else; code changes go through forks and PRs.
-- Its rulesets (section 6 has the reasons):
+- Its rulesets (section 6 has the reasons). The first two are configured on `fleet-coord`; the last two are recommended and not configured yet:
 
-  | Ruleset | Targets | Rules | Bypass |
-  |---|---|---|---|
-  | lock branches | `refs/heads/task-lock/**/*` | restrict deletion, block non-fast-forward (creation allowed: it is the first claim) | admin, maintain |
-  | default and archive branches | `~DEFAULT_BRANCH`, `refs/heads/archive` | restrict deletion, restrict updates, block non-fast-forward | admin, maintain |
-  | other branches | all branches except those above | restrict creation | admin, maintain |
-  | tags | all tags | restrict creation | admin, maintain |
+  | Ruleset | Targets | Rules | Bypass | On `fleet-coord` |
+  |---|---|---|---|---|
+  | lock branches | `refs/heads/task-lock/**/*` | restrict deletion, block non-fast-forward (creation allowed: it is the first claim) | admin, maintain | "no ff" (27205435) |
+  | default and archive branches | `~DEFAULT_BRANCH`, `refs/heads/archive` | restrict deletion, restrict updates, block non-fast-forward | admin, maintain | "protecc master" (27205300) |
+  | other branches | all branches except those above | restrict creation | admin, maintain | not configured |
+  | tags | all tags | restrict creation | admin, maintain | not configured |
+
+  The last two only stop the repo being used for unrelated storage; workers ignore other branches and tags, so nothing depends on them.
 
   GitHub Actions is disabled on the repo. The admin runs as an admin of the repo; workers are never given maintain, because maintain bypasses the rules.
 - Trust model: anyone with push access to the lock repo can write any status. This mode is cooperative. The merge itself does not trust `status.json`; see section 6.
