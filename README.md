@@ -21,7 +21,8 @@ admin and server are not implemented yet.
   - [`GitBackend.lean`](docs/design-lean/GitBackend.lean): the GitHub backend's operations
     (`snapshot`, `submit`, audit) as calls to `git ls-remote`, `git fetch` and `git push`.
   - [`GitBackendTest.lean`](docs/design-lean/GitBackendTest.lean): every state transition and
-    every denied update, with real pushes.
+    every denied update, with real pushes; and the failure modes of deleting lock branches
+    after acceptance, each reproduced without its guard and prevented with it.
 
 ## Checking
 

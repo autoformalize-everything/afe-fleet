@@ -30,13 +30,23 @@ What is exercised, always with real pushes:
    unrelated history; and (local remote only) forced rewrite and deletion.
 5. **A real race.** Several clients claim the same unclaimed task concurrently, each
    creating its lock branch: exactly one wins.
-
-An unclaimed task has no lock branch; its first claim creates it.
 6. **End to end.** The 20-event "nothing fails" trace and a zombie scenario, one push per
    event, a separate object store per worker, then an audit of the whole branch.
+7. **Retiring branches** (local only: needs a config repo and the admin's ruleset bypass).
+   After `accept` the admin writes `done/<task-id>.json` to the config repo and later deletes
+   the lock branch. Each failure mode that deletion opens is first *reproduced* with the
+   guard removed, then shown *prevented* with the guard in place:
+   - F1: a worker that fetched the config before the done record claims after the deletion.
+     Its claim recreates the branch and wins, so the pre-claim check is not enough. Guard:
+     re-fetch the config after a claim that created the branch.
+   - F2: a zombie holding a commit from before the deletion recreates the branch with a
+     plain push. Guard: always push with `--force-with-lease`.
+   - F3: during the grace period a late claim meets the `done` status and is denied.
+
+An unclaimed task has no lock branch; its first claim creates it.
 -/
 
-open Coord Git
+open Lean Coord Git
 
 structure Tally where
   pass : IO.Ref Nat
@@ -189,6 +199,8 @@ structure Ctx where
   a       : Client   -- honest writer
   b       : Client   -- competing writer
   r       : Client   -- independent reader / auditor
+  /-- Config repo (local runs only): holds `done/<task-id>.json`. -/
+  cfg     : String := ""
 
 def Ctx.client (x : Ctx) (name : String) : IO Client := Client.create name x.root x.remote x.pfx
 
@@ -489,6 +501,137 @@ def endToEnd (x : Ctx) : IO Nat := do
   x.tally.check ((← w2.audit v.rev.get!).isEmpty) "zombie: history is a legal run"
   return pushes
 
+/-! ## Section 7: retiring branches -/
+
+/-- Fetch the config repo's `main` tip. A `git fetch`, never a cached HTTP read. -/
+def Git.Client.fetchCfg (c : Client) (cfg : String) : IO (Option String) := do
+  let out ← c.run #["fetch", "-q", "--no-tags", cfg, "+refs/heads/main:refs/cfg/main"]
+  if out.exitCode != 0 then return none  -- no `main` yet: nothing is done
+  return some (← c.git #["rev-parse", "refs/cfg/main"])
+
+/-- Does the config at `rev` hold a done record for `task`? -/
+def Git.Client.hasDone (c : Client) (rev : Option String) (task : String) : IO Bool := do
+  let some rev := rev | return false
+  return (← c.run #["cat-file", "-e", s!"{rev}:done/{task}.json"]).exitCode == 0
+
+/-- Admin: commit `done/<task>.json` to the config repo's `main`, compare-and-swap on `main`. -/
+def Git.Client.writeDone (c : Client) (cfg task : String) (status : Task) (lockTip : String) : IO Unit := do
+  let parent ← c.fetchCfg cfg
+  let ix : Client := { c with env := c.env.push ("GIT_INDEX_FILE", some (c.dir / "cfg-index").toString) }
+  match parent with
+  | some p => discard <| ix.git #["read-tree", p]
+  | none => discard <| ix.git #["read-tree", "--empty"]
+  let body := Json.mkObj [("status", toJson status), ("lock_tip", lockTip)]
+  let blob ← ix.git #["hash-object", "-w", "--stdin"] (some (body.pretty ++ "\n"))
+  discard <| ix.git #["update-index", "--add", "--cacheinfo", s!"100644,{blob},done/{task}.json"]
+  let tree ← ix.git #["write-tree"]
+  let ps := match parent with | some p => #["-p", p] | none => #[]
+  let commit ← ix.git (#["commit-tree", tree] ++ ps ++ #["-m", s!"done: {task}"])
+  let out ← c.run #["push", "--porcelain", s!"--force-with-lease=refs/heads/main:{parent.getD ""}",
+                    cfg, s!"{commit}:refs/heads/main"]
+  if out.exitCode != 0 then throw <| IO.userError s!"writeDone {task}: {out.stderr}"
+
+/-- Admin deleting a lock branch. On GitHub the admin bypasses the deletion rule; here the
+remote denies deletes (like the ruleset), so the bypass is a ref update on the server. -/
+def adminDelete (x : Ctx) (task : String) : IO Unit := do
+  let out ← IO.Process.output
+    { cmd := "git", cwd := some x.remote, args := #["update-ref", "-d", s!"refs/heads/{x.pfx}{task}"] }
+  if out.exitCode != 0 then throw <| IO.userError s!"adminDelete {task}: {out.stderr}"
+
+/-- Drive a task from unclaimed to `done`: w1 authors, w2 reviews, admin accepts.
+Returns w2's snapshot while it held the review lease (a future zombie's view). -/
+def toDone (x : Ctx) (who : Array Client) (task : String) : IO Snap := do
+  let go (c : Client) (ev : Event) : IO Unit := do
+    let s ← c.read task
+    x.tally.check ((← c.submit .lease task s ev) matches .won _) s!"{task}: {repr ev}"
+  go who[1]! (.claim 1 0)
+  go who[1]! (.report 1 1 (.success 7))
+  go who[2]! (.claim 2 1)
+  let held ← who[2]!.read task
+  go who[0]! .accept
+  return held
+
+/-- A worker's claim, with or without the post-claim re-check of the config repo.
+`cfgSeen` is the config the worker decided on. Returns whether it ends up working. -/
+def claimFlow (x : Ctx) (w : Client) (wid : Nat) (task : String) (cfgSeen : Option String)
+    (recheck : Bool) : IO (Res × Bool) := do
+  if ← w.hasDone cfgSeen task then return (.denied, false)  -- pre-claim filter
+  let s ← w.read task
+  let res ← w.submit .lease task s (.claim wid s.val.epoch)
+  match res with
+  | .won _ =>
+    if recheck && s.rev.isNone then
+      -- the claim created the branch: the task may have been retired meanwhile
+      let fresh ← w.fetchCfg x.cfg
+      if ← w.hasDone fresh task then return (res, false)
+    return (res, true)
+  | _ => return (res, false)
+
+def retiring (x : Ctx) : IO Unit := do
+  let who := #[← x.client "admin7", ← x.client "w1-7", ← x.client "w2-7", ← x.client "w3-7"]
+  let admin := who[0]!
+  let w3 := who[3]!
+  let tipOfTask (t : String) := do return tipOf (← x.r.tips) t
+  let mut lines : Array (String × String) := #[]
+
+  -- F1: stale config, branch already deleted
+  for recheck in [false, true] do
+    let task := s!"retire/f1-{if recheck then "checked" else "naive"}"
+    discard <| toDone x who task
+    let cfgOld ← w3.fetchCfg x.cfg                       -- w3 decides on this config...
+    let tip ← (← tipOfTask task).getDM (throw <| IO.userError "no tip")
+    admin.writeDone x.cfg task (← admin.read task).val tip   -- ...then the admin retires the task
+    adminDelete x task
+    x.tally.check ((← tipOfTask task).isNone) s!"{task}: branch deleted"
+    x.tally.check (!(← w3.hasDone cfgOld task)) s!"{task}: the config w3 read has no done record"
+    let (res, working) ← claimFlow x w3 3 task cfgOld recheck
+    x.tally.check (res matches .won _) s!"{task}: the stale claim recreates the branch and wins"
+    if recheck then
+      x.tally.check (!working) s!"{task}: the post-claim re-check finds the done record; w3 stops"
+      -- admin sweep: lock branch for a task with a done record → delete
+      let fresh ← admin.fetchCfg x.cfg
+      x.tally.check (← admin.hasDone fresh task) s!"{task}: admin sees the done record"
+      adminDelete x task
+      x.tally.check ((← tipOfTask task).isNone) s!"{task}: admin sweep deletes the recreated branch"
+      lines := lines.push ("F1 with the post-claim re-check: worker stops, admin deletes the branch", "prevented")
+    else
+      x.tally.check working s!"{task}: without the re-check, w3 holds a lease on a done task"
+      lines := lines.push ("F1 stale config, pre-claim check only: claim on a done task wins", "reproduced")
+
+  -- F2: zombie recreates a deleted branch
+  do
+    let task := "retire/f2"
+    let held ← toDone x who task            -- w2 held the review lease when the admin accepted
+    let tip ← (← tipOfTask task).getDM (throw <| IO.userError "no tip")
+    admin.writeDone x.cfg task (← admin.read task).val tip
+    adminDelete x task
+    let w2 := who[2]!
+    let r ← w2.submit .lease task held (.review 2 2 .approve)
+    x.tally.check (r == .lost) s!"{task}: zombie's --force-with-lease push is rejected"
+    x.tally.check ((← tipOfTask task).isNone) s!"{task}: branch still absent"
+    let r ← w2.submit .ffOnly task held (.review 2 2 .approve)
+    x.tally.check (r matches .won _) s!"{task}: zombie's plain push recreates the deleted branch"
+    x.tally.check ((← tipOfTask task).isSome) s!"{task}: branch exists again"
+    lines := lines.push ("F2 zombie, plain fast-forward push: the deleted branch is recreated", "reproduced")
+    lines := lines.push ("F2 with --force-with-lease: the zombie's push is rejected", "prevented")
+    adminDelete x task
+
+  -- F3: grace period
+  do
+    let task := "retire/f3"
+    discard <| toDone x who task
+    let cfgOld ← w3.fetchCfg x.cfg
+    let tip ← (← tipOfTask task).getDM (throw <| IO.userError "no tip")
+    admin.writeDone x.cfg task (← admin.read task).val tip
+    -- not deleted yet
+    let (res, working) ← claimFlow x w3 3 task cfgOld false
+    x.tally.check (res == .denied && !working) s!"{task}: a late claim meets `done` and is denied"
+    lines := lines.push ("F3 late claim during the grace period: denied by the rules", "prevented")
+    adminDelete x task
+
+  for (what, verdict) in lines do
+    IO.println s!"   {pad what 76}{verdict}"
+
 def cleanup (x : Ctx) : IO Unit := do
   if !x.isLocal then
     let tips ← x.a.tips
@@ -524,7 +667,14 @@ def suite (remote : Option String) : IO (Nat × Nat) := do
     | some url => pure (url, s!"task-lock-test/{(← IO.monoNanosNow) % 1000000000}/")
     | none => pure (← localRemote root, "task-lock/")
   let mk (name : String) := Client.create name root url pfx
-  let x : Ctx := { tally, root, remote := url, pfx, isLocal,
+  let cfg ← if isLocal then do
+      let dir := root / "config.git"
+      IO.FS.createDirAll dir
+      let out ← IO.Process.output { cmd := "git", args := #["init", "-q", "--bare", "."], cwd := some dir }
+      if out.exitCode != 0 then throw <| IO.userError out.stderr
+      pure dir.toString
+    else pure ""
+  let x : Ctx := { tally, root, remote := url, pfx, isLocal, cfg,
                    a := ← mk "a", b := ← mk "b", r := ← mk "reader" }
   IO.println s!"\n== {if isLocal then "local" else "remote"}: {url}"
   IO.println s!"prefix: {pfx}"
@@ -545,6 +695,11 @@ def suite (remote : Option String) : IO (Nat × Nat) := do
     IO.println s!"5. concurrent claims: {nRace} races, exactly one winner each"
     let nPush ← endToEnd x
     IO.println s!"6. end to end:        {nPush} single-event pushes, plus the zombie scenario"
+    if isLocal then
+      IO.println "7. retiring branches (failure modes with the guard removed, then with it):"
+      retiring x
+    else
+      IO.println "7. retiring branches: skipped (local only)"
   catch e =>
     tally.check false s!"exception: {e}"
   try cleanup x catch e => tally.check false s!"cleanup: {e}"

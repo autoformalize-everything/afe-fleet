@@ -89,11 +89,11 @@ Firing it on a slow but living worker wastes that worker's effort and nothing el
   "epoch": 3,
   "lease": {
     "worker": "alice/box1-2", "gh_user": "alice", "nonce": "9f2c61d0",
-    "spec_rev": "c0ffee1…", "claimed_at": "2026-11-13T12:00:00Z", "heartbeat_at": "2026-11-13T12:35:00Z",
+    "spec_rev": "c0ffee1…", "spec": "5d0a…", "claimed_at": "2026-11-13T12:00:00Z", "heartbeat_at": "2026-11-13T12:35:00Z",
     "note": "lake build running; 3 commits; 412k tokens",
     "checkpoint": {"repo": "alice/project", "ref": "task/zlib/inflate/e3", "sha": "4b1e…"}
   },
-  "pr": {"repo": "org/project", "number": 42, "head_sha": "77ac…", "draft": true},
+  "pr": {"repo": "org/project", "number": 42, "head_sha": "77ac…", "draft": true, "spec": "5d0a…"},
   "author": null,
   "strikes": 2,
   "rounds": 0,
@@ -109,10 +109,10 @@ Firing it on a slow but living worker wastes that worker's effort and nothing el
 
 - `last.outcome` is `success`, `partial` or `failure` for work leases, and `approve`, `changes`, `abstain`, `expired` or `rework` otherwise. `success` and `partial` always carry `pr`; `partial` and `failure` always carry `debug` and `progress`.
 - Timestamps are informational. No decision compares a timestamp written by one machine against another machine's clock.
-- `spec_rev` is the tasks-repo commit the attempt read its task and project files from, so the reviewer and admin know which version was used.
+- `spec_rev` is the config-repo commit the attempt read its task and project files from. `spec` is the task's content hash at that commit (section 5, "Where decisions come from"); `pr.spec` is the one the PR was written against.
 - `nonce` distinguishes two processes that share a worker id (a restarted worker must not silently inherit the old process's lease).
 - Keep it under about 8 KB. Full transcripts go to a separate ref or URL named in `debug.log`, after secret redaction.
-- History is the commit chain of the branch (GitHub) or the `events` table (server).
+- History is the commit chain of the branch (GitHub) or the `events` table (server). On GitHub it stays reachable through the `archive` branch after the lock branch is deleted (section 4).
 
 ## 4. Mapping to the two backends
 
@@ -153,8 +153,30 @@ Event to operation:
 - **One ref per task.** The lock branch `task-lock/<task-id>` (full name `refs/heads/task-lock/<task-id>`) is the only coordination ref a task has. Its tip is both the lock and the status. There is no separate `refs/lock/<task-id>`: a second ref would need a second write, and there would be a window where the two disagree.
 - Task ids are tree paths. Only leaves are tasks, so `task-lock/a` and `task-lock/a/b` never both exist (git cannot store both).
 - **No lock branch means nobody has claimed the task yet.** It reads as the initial status (`need = work`, epoch 0, no lease). The first claim creates the branch with `--force-with-lease=<ref>:` (empty expected value = create only), so workers start tasks without any admin step. If several workers create it at once, git accepts exactly one; the others see "stale info" or "reference already exists" and treat it as `Lost`, not as an error (the reference project once misread the latter as an outage).
-- **After that the branch stays for the life of the task**, also between leases, because it holds the PR, strikes and epoch. So "lock branch exists" means "someone has worked on this", and "someone is working on it now" is `lease ≠ null` in its `status.json`. Deleting the branch on release would lose that state, and reusing a task id would restart the epoch.
-- In the formal model, a missing branch is the empty log (`Log.Run.init`, revision 0), so the proofs are unchanged.
+- **The branch lives from the first claim until the task is accepted**, also between leases, because it holds the PR, strikes and epoch. Once the admin has merged the PR and committed `accept`, it records the task as done in the config repo and deletes the branch. So `fleet-coord` holds one branch per task that is in progress or waiting for review or merge, not one per task ever done:
+
+  | Task is | Lock branch | Record of it |
+  |---|---|---|
+  | never claimed | none | the task in the config tree |
+  | claimed, in progress, partial, in review, awaiting merge | `task-lock/<task-id>`; `lease` set while someone works on it | `status.json` at the branch tip |
+  | accepted | deleted after a grace period | `done/<task-id>.json` in the config repo, plus the `archive` branch |
+
+- **Retiring a branch**, in this order, each step idempotent:
+  1. `accept` is committed on the lock branch (`need = done`; no further event is legal, `done_final`).
+  2. The admin commits `done/<task-id>.json` to the config repo: the final `status.json` plus the lock tip SHA. This file is the durable "done" record. It lives outside the task's directory, so it does not change the task's `spec`.
+  3. The admin adds a commit to the single `archive` branch of `fleet-coord` whose second parent is the lock tip, so the task's full history stays reachable after its branch is gone.
+  4. After a grace period (default 1 hour from step 2), the admin deletes the lock branch. The admin bypasses the deletion rule; workers still cannot delete.
+- **Done means `done/<task-id>.json` exists.** Without it, a deleted branch would look like a task nobody has claimed. A worker could have fetched the config repo before the done record was written, and its claim could land after the branch was deleted. So the worker checks twice:
+  1. Before claiming it skips tasks with a done record. This is only a filter that avoids wasted claims.
+  2. **After a claim that created the branch** it fetches the config repo again and looks for the done record. This check is the guarantee. A claim can create the branch only while it is absent, and for a done task the branch is absent only after the admin deleted it, which happens only after the done record was committed. The second fetch starts after the claim landed, so it sees the record. No clock or timing assumption is involved.
+
+  The check needs a linearizable read: a `git fetch` of the config repo's branch tip. `raw.githubusercontent.com` and the contents API can serve content that is minutes old and must not be used. I believe GitHub's git endpoints are linearizable (a push is acknowledged once its replicas agree) but have not verified it.
+
+  When the re-check finds a done record, the worker stops without further writes. The branch stays leased to it, nobody else claims it (the record makes it ineligible), and the admin's next sweep deletes it. A worker that crashes between the claim and the re-check is cleaned up the same way.
+
+  The grace period before deletion is only for efficiency: while the branch still exists with `need = done`, a late claim is rejected by `step`, so workers that read the config just before the record landed do not recreate the branch only to back off.
+- **Every write must use `--force-with-lease`; plain fast-forward pushes are not safe once branches are deleted.** A zombie that holds a commit from before the deletion would *recreate* the branch with a plain push, because there is nothing for it to fast-forward over. With `--force-with-lease=<ref>:<old tip>` the push is rejected as "stale info", because the ref no longer exists. (Checked against a local bare repository: the plain push created the branch, the lease push was rejected.) The git test still exercises both modes. Only the lease mode is used by the design.
+- In the formal model, a missing branch is the empty log (`Log.Run.init`, revision 0), and one branch's life is one `Log.Run` ending in `done`, so the proofs are unchanged. Deletion and the done record are outside the per-task model; the done record is what keeps a task's life from starting again.
 - A lock branch whose name is not a task in the tree is ignored by workers. The admin deletes it (it bypasses the deletion rule).
 - **The lock repo is a repository of its own** (`autoformalize-everything/fleet-coord`), separate from the config repo (`fleet.toml` and the task tree) and from the code repos. It holds nothing but a default branch with a README, the lock branches, and the access-request issues. Workers get push access to it and nothing else; code changes go through forks and PRs.
 - Its rulesets (section 6 has the reasons):
@@ -162,8 +184,8 @@ Event to operation:
   | Ruleset | Targets | Rules | Bypass |
   |---|---|---|---|
   | lock branches | `refs/heads/task-lock/**/*` | restrict deletion, block non-fast-forward (creation allowed: it is the first claim) | admin, maintain |
-  | default branch | `~DEFAULT_BRANCH` | restrict deletion, restrict updates, block non-fast-forward | admin, maintain |
-  | other branches | all branches except the two above | restrict creation | admin, maintain |
+  | default and archive branches | `~DEFAULT_BRANCH`, `refs/heads/archive` | restrict deletion, restrict updates, block non-fast-forward | admin, maintain |
+  | other branches | all branches except those above | restrict creation | admin, maintain |
   | tags | all tags | restrict creation | admin, maintain |
 
   GitHub Actions is disabled on the repo. The admin runs as an admin of the repo; workers are never given maintain, because maintain bypasses the rules.
@@ -175,11 +197,35 @@ Event to operation:
 loop:
   recover()        finish or abandon what the journal says was in flight; remove stray containers
   maintain()       config / binary / unit update (only here, never mid-attempt); preflight
-  snapshot()       candidates = unleased ∧ need ∈ my kinds ∧ claimable ∧ deps done ∧ filter ∧ cooldown over
-  submit(claim)    Lost → pick another immediately; nothing claimable → idle backoff 30 s … 15 min
+  snapshot()       fetch the config repo, then the lock branches
+                   candidates = in the tree ∧ unleased ∧ need ∈ my kinds ∧ claimable ∧ deps done ∧ filter ∧ cooldown over
+  submit(claim)    CAS against the lock tip the decision was made on; records spec_rev and spec
+                   if the claim created the branch: fetch the config repo again; done record → stop (section 4)
+                   Lost → pick another immediately; nothing claimable → idle backoff 30 s … 15 min
   run attempt      journal, workspace, heartbeat thread, agent supervisor
   finish           verify → push → PR or review → submit(report) → cleanup
 ```
+
+**Where decisions come from.** A claim is safe only if everything it was decided on is either checked by the CAS or cannot go stale in a harmful way:
+
+| Input | Read from | If it is stale |
+|---|---|---|
+| `need`, `lease`, `epoch`, `author`, `strikes` | the task's lock branch, in the same read whose tip the CAS expects | The CAS rejects the claim (`Log.stale_rejected`; the git test pushes 190 such stale writes and all are rejected) |
+| Dependencies done | `done/<task-id>.json` in the config repo | Harmless: only the admin writes done records and never removes them, so a stale read can only say "not done yet" |
+| The task is not done | `done/<task-id>.json` in the config repo | Re-checked after a claim that created the branch; exact, see "Retiring a branch" in section 4 |
+| The task exists, its `TASK.md`, `task.toml`, `project.toml` | the config repo | Not covered by the CAS. Handled by `spec` (below) |
+| `STATUS.md` in the config repo | derived by the admin | Never an input. It is a summary for humans |
+
+The report that ends a lease and the status change it causes are one commit, and the admin never clears a lease except by an `expire` commit on the same branch. So a worker cannot claim on the strength of a status the admin has since changed: whichever write lands second was based on the old tip and is rejected.
+
+The config repo is the one input outside that CAS. A human can edit or delete a task between a worker reading the tree and the worker's claim landing. To bound that:
+
+- `spec` is the content hash of what defines the task: the git tree hash of its directory plus the blob hash of the `project.toml` it inherits. The worker fetches the config repo immediately before claiming and writes `spec_rev` and `spec` into the claim commit.
+- The admin compares every lease's `spec` with the current tree on each sweep. If it differs, it expires the lease (reason `spec-changed`). If the task is gone, it deletes the lock branch, which also fences the holder (its next push expects a tip that no longer exists).
+- For `need = review` or `merge`, the admin compares `pr.spec`. If the task changed after the PR was written, it sends the task back with `rework`.
+- So a lease on a stale definition lives at most one admin sweep, and after that every write it makes is rejected (`zombie_fenced`). The wasted work is bounded by the sweep interval plus one heartbeat.
+
+A stronger version would make the claim itself carry `spec` and reject a mismatch in `step`. That needs the current `spec` on the lock branch before anyone claims, which brings back admin pre-created branches plus an admin commit on every affected branch for each tree change. For a bounded few minutes of wasted work, I don't think that is worth it.
 
 **Selection** is random within a priority order: review, fix after "changes", continue a partial, new work. Random choice makes collisions rare; CAS makes them harmless.
 
@@ -315,17 +361,22 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 
 | Observed | Action |
 |---|---|
-| Lock branch for a task id that is not in the tree | delete it |
+| Lock branch for a task id that is not in the tree | delete it (this also fences a holder) |
 | Leased, tip unchanged for TTL across my own successful polls | `expire` |
+| Leased, and the lease's `spec` differs from the task's current content hash | `expire` (reason `spec-changed`) |
+| `need` is `review` or `merge`, and `pr.spec` differs from the current content hash | `rework` (reason `spec-changed`) |
 | `need = merge`, PR head = `reviewed_sha`, required checks green, mergeable | merge with the API's `sha` guard, then `accept` |
 | `need = merge`, PR already merged | `accept` (crash between merge and accept, or a human merged) |
+| `need = done`, no `done/<task-id>.json` | write it, then add the lock tip to the `archive` branch |
+| `need = done`, done record older than the grace period | delete the lock branch |
+| Lock branch for a task that has a done record, `need ≠ done` | delete it (a claim from a stale tree; its worker has already stopped, or crashed before checking) |
 | `need = merge`, checks red, conflict, or head moved | `rework` with the reason and log excerpt |
 | `need = merge`, checks pending | wait; after the CI timeout, `rework` |
 | `need = review`, PR closed unmerged | `rework` |
 | `strikes` or `rounds` over threshold | label for a human (section 7) |
 | New commit on a lock branch that is not a legal `step` from its parent | push a repair commit restoring the last legal status |
 | Open PR not referenced by any status for over an hour | close as superseded |
-| Anything changed | regenerate `STATUS.md` and `status.json` in the tasks repo, one commit per sweep |
+| Anything changed | regenerate `STATUS.md` in the config repo, one commit per sweep. A summary for humans; no worker reads it |
 | Open issue in the lock repo with `write-request` in the title | grant its creator write access (below) |
 
 - The merge does not trust `status.json` alone. It also requires what GitHub itself authenticates: the PR exists, its head is the reviewed SHA, and CI is green on that SHA.
@@ -395,7 +446,11 @@ Even then, any grantee can write any task's status. The audit catches illegal tr
 | Access invitation not accepted within 7 days | Admin sweep sees `expired` | Re-invite, at most 3 times, then close the issue |
 | Over 50 invitations in a day | `PUT` fails | Issues stay open; later sweeps continue |
 | PR closed by a human | Admin sweep | `rework` |
-| Task deleted from the tree | Admin sync | Close its PR, delete the lock branch (a human edit of the task set, outside the model) |
+| Task deleted from the tree | Admin sync | Close its PR, delete the lock branch; the holder's next push is rejected |
+| Task edited while claimed, or claimed from a stale tree | Admin compares `spec` | `expire`, or `rework` if a PR exists; fenced within one sweep |
+| F1: worker read the config before a done record, claims after the branch was deleted | Worker's post-claim re-fetch of the config | Worker stops; admin deletes the recreated branch. Reproduced without the re-check, prevented with it, in `GitBackendTest` section 7 |
+| F2: zombie pushes a commit from before the deletion | `--force-with-lease` (ref no longer exists) | Rejected. A plain push would recreate the branch; both shown in `GitBackendTest` section 7 |
+| F3: late claim during the grace period | `step`: the task is `done` | Denied; `GitBackendTest` section 7 |
 | Bad self-update | Self-test, start guard | Rolled back to the previous binary |
 | Buggy client writes an illegal status | Admin audit | Repair commit |
 | Task no agent can do | `strikes` | Escalation, below |
@@ -426,7 +481,7 @@ Even then, any grantee can write any task's status. The audit catches illegal tr
 16. **Secrets in debug reports.** Transcripts must be redacted before they are published.
 17. **Server mode needs** per-worker bearer tokens, TLS and SQLite backups, and it is a single point of failure that GitHub mode does not have.
 18. **Onboarding is a write grant to anyone who asks** in `auto` mode. Section 6 lists what must be protected first; for a public repo, `approve` is the safer default.
-19. **Scale limit of GitHub mode.** One ref per task works for thousands of tasks; tens of thousands make `ls-remote` slow. That is the point to switch to the server.
+19. **Scale limit of GitHub mode.** Lock branches exist only for tasks in flight, so the count tracks fleet activity, not the size of the task tree. Done records are files in the config repo. Thousands of concurrent in-flight tasks would make `ls-remote` slow; that is the point to switch to the server.
 
 ## 9. Size and build order
 
