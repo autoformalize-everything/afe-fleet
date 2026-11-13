@@ -63,7 +63,7 @@ structure Task where
   strikes : Nat
   deriving DecidableEq, Repr
 
-/-- A freshly published task. -/
+/-- A task nobody has claimed yet. On GitHub: a task in the tree with no lock branch. -/
 def Task.init : Task := ⟨.work, 0, none, none, none, 0⟩
 
 /-- Final report of a work lease. -/
@@ -482,8 +482,9 @@ theorem Log.one_winner {l l' : Log} {s : Snapshot} {ev₁ : Event}
     · contradiction
   · contradiction
 
-/-- Every history a backend can contain: start from a published task, then any number of
-clients submit, each working from some earlier read of the log. -/
+/-- Every history a backend can contain: start from an unclaimed task (on GitHub: no lock
+branch, revision 0; the first successful submit creates it), then any number of clients
+submit, each working from some earlier read of the log. -/
 inductive Log.Run : Log → Prop where
   | init : Log.Run ⟨Task.init, []⟩
   | submit {l₀ l l' : Log} (ev : Event) :

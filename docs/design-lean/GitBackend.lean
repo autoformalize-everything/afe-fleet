@@ -14,6 +14,12 @@ Everything here is one of four git operations against the lock repo:
 A lock branch is a chain of commits. Each commit's tree is exactly one file, `status.json`
 (here: the fields of `Coord.Task`), and its message records the event that produced it, so
 the branch is its own audit log.
+
+**A missing lock branch is a task nobody has claimed yet** (`Task.init`). The first claim
+creates the branch with a create-only push, so workers need no admin step to start a task,
+and the root commit is checked like every other: it must be a legal step from `Task.init`.
+Lock branches are never deleted while their task exists, because the history (PR, strikes,
+epoch) lives on them.
 -/
 
 open Lean
@@ -81,8 +87,6 @@ def Client.commit (c : Client) (status : Task) (parent : Option String) (msg : J
 def Client.eventMsg (c : Client) (ev : Event) : IO Json :=
   return Json.mkObj [("event", toJson ev), ("by", c.name), ("nonce", (← c.nonce))]
 
-def Client.publishMsg (c : Client) : IO Json :=
-  return Json.mkObj [("publish", true), ("by", c.name), ("nonce", (← c.nonce))]
 
 /-! ## The write primitive -/
 
@@ -166,18 +170,20 @@ def Client.statusAt (c : Client) (sha : String) : IO Task := do
   | .error e => throw <| IO.userError s!"bad status.json at {sha}: {e}"
 
 structure Snap where
-  rev : String
+  /-- Tip commit, or `none` when the lock branch does not exist (unclaimed task). -/
+  rev : Option String
   val : Task
   deriving Inhabited
 
-/-- `snapshot()` for one task. -/
-def Client.read (c : Client) (task : String) : IO (Option Snap) := do
-  let some _ ← c.tip task | return none
+/-- `snapshot()` for one task. No lock branch = unclaimed. -/
+def Client.read (c : Client) (task : String) : IO Snap := do
+  let some _ ← c.tip task | return ⟨none, Task.init⟩
   discard <| c.git #["fetch", "-q", "--no-tags", c.remote, s!"+{c.ref task}:refs/remotes/lock/{task}"]
   let sha ← c.git #["rev-parse", s!"refs/remotes/lock/{task}"]
-  return some ⟨sha, ← c.statusAt sha⟩
+  return ⟨some sha, ← c.statusAt sha⟩
 
-/-- `snapshot()` for every task: one fetch, then local reads. -/
+/-- `snapshot()` for every task that has a lock branch: one fetch, then local reads.
+Tasks in the task tree that are missing here are unclaimed. -/
 def Client.snapshot (c : Client) : IO (Array (String × Snap)) := do
   c.fetchAll
   let out ← c.git #["for-each-ref", "--format=%(refname)\t%(objectname)", "refs/remotes/lock/"]
@@ -185,7 +191,7 @@ def Client.snapshot (c : Client) : IO (Array (String × Snap)) := do
   let mut res := #[]
   for line in out.splitOn "\n" do
     match line.splitOn "\t" with
-    | [ref, sha] => res := res.push ((ref.drop base.length).toString, ⟨sha, ← c.statusAt sha⟩)
+    | [ref, sha] => res := res.push ((ref.drop base.length).toString, ⟨some sha, ← c.statusAt sha⟩)
     | _ => pure ()
   return res
 
@@ -213,26 +219,23 @@ partial def Client.cas (c : Client) (mode : Mode) (task : String) (expect : Opti
   IO.sleep 50                                   -- not applied and not moved: transient, retry
   c.cas mode task expect commit (tries - 1)
 
-def Client.publish (c : Client) (task : String) : IO Res := do
-  let commit ← c.commit Task.init none (← c.publishMsg)
-  return if ← c.cas .lease task none commit then .won commit else .lost
-
 def Client.submit (c : Client) (mode : Mode) (task : String) (s : Snap) (ev : Event) : IO Res := do
   match step s.val ev with
   | none => return .denied
   | some t' =>
-    let commit ← c.commit t' (some s.rev) (← c.eventMsg ev)
-    return if ← c.cas mode task (some s.rev) commit then .won commit else .lost
+    -- on an unclaimed task this is a root commit pushed create-only
+    let commit ← c.commit t' s.rev (← c.eventMsg ev)
+    return if ← c.cas mode task s.rev commit then .won commit else .lost
 
 /-! ## Audit: is this branch a legal run of the state machine? -/
 
 /-- Walk the branch from its root. Every commit must hold exactly `status.json`, have at most
-one parent, and be `step parent event`. Returns the violations (empty = legal).
+one parent, and be `step parent event`; the root's parent is `Task.init`. Returns the violations (empty = legal).
 Needs the commits locally (`fetchAll` or `read` first). -/
 def Client.audit (c : Client) (tip : String) : IO (Array String) := do
   let log ← c.git #["log", "--reverse", "--format=%H%x09%P%x09%s", tip]
   let mut bad := #[]
-  let mut prev : Option Task := none
+  let mut prev := Task.init
   let mut i := 0
   for line in log.splitOn "\n" do
     match line.splitOn "\t" with
@@ -241,18 +244,15 @@ def Client.audit (c : Client) (tip : String) : IO (Array String) := do
       if files != "status.json" then bad := bad.push s!"#{i} {sha.take 8}: tree is not exactly status.json"
       if (parents.splitOn " ").length > 1 then bad := bad.push s!"#{i} {sha.take 8}: merge commit"
       let st ← c.statusAt sha
-      match prev, Json.parse subject with
-      | none, .ok msg =>
-        if (msg.getObjValAs? Bool "publish").toOption != some true || st != Task.init then
-          bad := bad.push s!"#{i} {sha.take 8}: root is not a published task"
-      | some p, .ok msg =>
+      match Json.parse subject with
+      | .ok msg =>
         match msg.getObjValAs? Event "event" with
         | .ok ev =>
-          if step p ev != some st then
+          if step prev ev != some st then
             bad := bad.push s!"#{i} {sha.take 8}: not a legal step: {repr ev}"
         | .error _ => bad := bad.push s!"#{i} {sha.take 8}: no event in commit message"
-      | _, .error _ => bad := bad.push s!"#{i} {sha.take 8}: commit message is not JSON"
-      prev := some st
+      | .error _ => bad := bad.push s!"#{i} {sha.take 8}: commit message is not JSON"
+      prev := st
       i := i + 1
     | _ => bad := bad.push s!"unparseable log line: {line}"
   return bad

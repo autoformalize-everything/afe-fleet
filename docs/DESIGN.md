@@ -19,7 +19,7 @@ A status is "what the task needs next" plus an optional lease.
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> work: admin publishes
+    [*] --> work: task added to the tree (no lock branch yet)
     work --> work: claim / heartbeat / failure / partial / expire
     work --> review: report success (PR)
     review --> review: claim / heartbeat / abstain / expire
@@ -136,7 +136,7 @@ changes(since)             -> events after a cursor
 | `changes()` | `git ls-remote lock 'refs/heads/task-lock/*'` every 20 s, diff against the last map, walk `old..new` on changed lock branches. Each commit is one event, so nothing is missed after downtime. | `GET /admin/events?after=<seq>` (long-poll) |
 | Who runs `step` | The client; the admin audits every new commit and repairs illegal ones | The server; illegal events get 409 |
 | Lease expiry | Admin: "tip unchanged for TTL across my own successful polls" | Same rule, same code |
-| Publish a task | Admin creates the lock branch with an empty expected value (create-only) | `PUT /admin/tasks` |
+| Publish a task | Nothing to do: a task in the tree with no lock branch is unclaimed, and its first claim creates the branch (create-only push, empty expected value) | `PUT /admin/tasks` |
 
 Event to operation:
 
@@ -152,9 +152,21 @@ Event to operation:
 
 - **One ref per task.** The lock branch `task-lock/<task-id>` (full name `refs/heads/task-lock/<task-id>`) is the only coordination ref a task has. Its tip is both the lock and the status. There is no separate `refs/lock/<task-id>`: a second ref would need a second write, and there would be a window where the two disagree.
 - Task ids are tree paths. Only leaves are tasks, so `task-lock/a` and `task-lock/a/b` never both exist (git cannot store both).
-- The admin pre-creates every lock branch when a task is published. Workers only ever fast-forward an existing lock branch, which removes the create race the reference project had to special-case.
-- A ruleset on `task-lock/**` blocks deletion and non-fast-forward for everyone but the admin identity.
-- The lock repo can be separate from the code repo, so workers need push access to lock branches but only fork-and-PR access to code.
+- **No lock branch means nobody has claimed the task yet.** It reads as the initial status (`need = work`, epoch 0, no lease). The first claim creates the branch with `--force-with-lease=<ref>:` (empty expected value = create only), so workers start tasks without any admin step. If several workers create it at once, git accepts exactly one; the others see "stale info" or "reference already exists" and treat it as `Lost`, not as an error (the reference project once misread the latter as an outage).
+- **After that the branch stays for the life of the task**, also between leases, because it holds the PR, strikes and epoch. So "lock branch exists" means "someone has worked on this", and "someone is working on it now" is `lease ≠ null` in its `status.json`. Deleting the branch on release would lose that state, and reusing a task id would restart the epoch.
+- In the formal model, a missing branch is the empty log (`Log.Run.init`, revision 0), so the proofs are unchanged.
+- A lock branch whose name is not a task in the tree is ignored by workers. The admin deletes it (it bypasses the deletion rule).
+- **The lock repo is a repository of its own** (`autoformalize-everything/fleet-coord`), separate from the config repo (`fleet.toml` and the task tree) and from the code repos. It holds nothing but a default branch with a README, the lock branches, and the access-request issues. Workers get push access to it and nothing else; code changes go through forks and PRs.
+- Its rulesets (section 6 has the reasons):
+
+  | Ruleset | Targets | Rules | Bypass |
+  |---|---|---|---|
+  | lock branches | `refs/heads/task-lock/**/*` | restrict deletion, block non-fast-forward (creation allowed: it is the first claim) | admin, maintain |
+  | default branch | `~DEFAULT_BRANCH` | restrict deletion, restrict updates, block non-fast-forward | admin, maintain |
+  | other branches | all branches except the two above | restrict creation | admin, maintain |
+  | tags | all tags | restrict creation | admin, maintain |
+
+  GitHub Actions is disabled on the repo. The admin runs as an admin of the repo; workers are never given maintain, because maintain bypasses the rules.
 - Trust model: anyone with push access to the lock repo can write any status. This mode is cooperative. The merge itself does not trust `status.json`; see section 6.
 
 ## 5. Worker
@@ -253,13 +265,17 @@ sha256.x86_64-linux = "…"
 
 [coord]
 mode = "github"                     # or "server"; exactly one
-lock_repo = "org/af-locks"
-tasks_repo = "org/af-tasks"
+lock_repo = "autoformalize-everything/fleet-coord"   # lock branches only
+tasks_repo = "org/fleet-config"     # the task tree; this file usually lives here too
 # url = "https://coord.example.org"
 
 [lease]
 heartbeat = "5m"
 ttl = "20m"
+
+[access]                            # GitHub mode; section 6
+write_request = "auto"              # "auto" | "approve" | "off"
+deny = []                           # logins never granted
 ```
 
 Everything about the code being worked on is outside the coordination design and lives in the task tree. A `project.toml` in any directory above a task describes its project; the nearest one wins.
@@ -282,7 +298,7 @@ verify = ["lake", "build"]
 
 - Coordination never reads `project.toml`. The worker resolves it after claiming, at the `spec_rev` it records in the lease; `status.json` carries the resulting `pr.repo`.
 - One fleet can therefore serve many code repos and images, and a worker's filter can select by subtree.
-- A task with no `project.toml` above it is not published by the admin.
+- A task with no `project.toml` above it is not claimable, and workers skip it.
 - The service-name key is `[fleet] name`, because "project" means a code project in the tree. The service is unique per fleet config.
 
 Service and updates:
@@ -299,7 +315,7 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 
 | Observed | Action |
 |---|---|
-| Task in the tree with no lock branch | publish (create-only) |
+| Lock branch for a task id that is not in the tree | delete it |
 | Leased, tip unchanged for TTL across my own successful polls | `expire` |
 | `need = merge`, PR head = `reviewed_sha`, required checks green, mergeable | merge with the API's `sha` guard, then `accept` |
 | `need = merge`, PR already merged | `accept` (crash between merge and accept, or a human merged) |
@@ -310,11 +326,52 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 | New commit on a lock branch that is not a legal `step` from its parent | push a repair commit restoring the last legal status |
 | Open PR not referenced by any status for over an hour | close as superseded |
 | Anything changed | regenerate `STATUS.md` and `status.json` in the tasks repo, one commit per sweep |
+| Open issue in the lock repo with `write-request` in the title | grant its creator write access (below) |
 
 - The merge does not trust `status.json` alone. It also requires what GitHub itself authenticates: the PR exists, its head is the reviewed SHA, and CI is green on that SHA.
 - After a polling gap longer than one heartbeat interval (admin restart, GitHub outage), all TTL timers restart. Otherwise an outage would expire every lease at once.
-- If a project's base branch goes red after a merge, the admin stops merging into that project and publishes a top-priority `fix-main` task under it.
+- If a project's base branch goes red after a merge, the admin stops merging into that project and adds a top-priority `fix-main` task under it in the tree.
 - Only the admin reads PR and CI state. Workers read only lock branches. Reads do not grow with fleet size, which is the wall the reference project hit (about 526 REST calls per worker per hour).
+
+### Access requests
+
+GitHub mode only. A worker needs push access to the lock repo (`coord.lock_repo`). To get it, its operator opens an issue in that repo with `write-request` in the title. The admin gives **the issue's creator** write access.
+
+The grantee is always `issue.user.login`, which GitHub authenticates. Nothing in the title or body is parsed, so an issue cannot request access for someone else.
+
+Each sweep lists open issues with one conditional request (`GET /repos/{lock_repo}/issues?state=open`, with an ETag; unchanged lists cost nothing). It keeps entries with `write-request` in the title (case-insensitive), no `pull_request` field (the endpoint also returns PRs), and `user.type == "User"`. Then for each issue, oldest first:
+
+| Observed (`u` = issue creator) | Action |
+|---|---|
+| `GET /repos/{lock_repo}/collaborators/{u}/permission` says `write` or `admin` | comment "granted", close |
+| `u` in `deny`, or `write_request = "off"` | comment "declined", close |
+| `write_request = "approve"` and no `write-approved` label | wait |
+| An open invitation for `u` in `GET /repos/{lock_repo}/invitations` | comment once with the accept link, wait |
+| An expired invitation for `u` | delete it, re-invite (at most 3 times, then comment and close) |
+| Otherwise | `PUT /repos/{lock_repo}/collaborators/{u}` with `{"permission": "push"}` |
+| `PUT` returned 201 | invitation sent; comment with the accept link, wait |
+| `PUT` returned 204 | access granted directly (organization member); next sweep closes |
+| `PUT` returned 403 or 422 | comment the error, label `write-request-failed`, leave for a human |
+
+- **Stateless and resumable.** Every row is decided from what GitHub reports now. A crash between any two calls is repaired by the next sweep, and repeating `PUT` for an existing collaborator returns 204 with no other effect. Comments carry `<!-- afe-fleet access=<step> -->` and are posted only if that marker is not already on the issue.
+- **Check before granting.** The permission check comes first because `PUT` also *changes* an existing collaborator's role, so granting `push` to a maintainer would downgrade them.
+- **The user must accept.** For someone outside the organization, `PUT` creates an invitation, which expires after 7 days. The issue stays open until the permission check shows `write`.
+- **Rate limit.** GitHub allows 50 invitations per repository per 24 hours (none for organization members). Over the limit `PUT` fails, and the remaining issues stay open until a later sweep.
+- **Approval.** In `approve` mode the signal is a label, because only users with triage access or higher can add labels; anyone can write a comment.
+- **Admin credentials.** The admin's token must have admin rights on the lock repo. GitHub's REST docs do not list the fine-grained permission for this endpoint; I expect "Administration: write" but have not verified it.
+- **Worker side.** When `afe-fleet worker install` finds that its GitHub user cannot push to the lock repo, it offers to open the issue (`write-request: <login>`). It then polls and accepts the invitation with the operator's own `gh` credential (`PATCH /user/repository_invitations/{id}`), so the operator has nothing else to do.
+
+**What write access gives, and what must be protected first.** Write access to a repository is broad. The grant is limited to the lock repo, which holds no configuration, so a grantee cannot change `fleet.toml` or the task tree (self-update would make that code execution on every worker; section 8, item 15). On the lock repo itself, the rulesets in section 4 do the rest:
+
+1. **Lock branches cannot be deleted or rewritten**, so a grantee can only append to a task's history, and every append is checked by the audit.
+2. **Lock branches can be created**, because that is how a task is first claimed. This does not let a grantee add tasks: the task list is the tree in the config repo, which they cannot write. A branch for an unknown id is ignored and deleted by the admin. A branch for a real task must start with a legal claim from the initial status, or the audit flags it.
+3. **The default branch cannot be changed** by workers.
+4. **Other branches and tags cannot be created** by workers. Readers ignore them anyway; the rule only stops the repo from being used for unrelated storage.
+5. **GitHub Actions is disabled.** Otherwise a grantee could push a branch containing a workflow, and it would run with the repository's token.
+
+Write is the right role: GitHub's `maintain` and `admin` roles bypass these rulesets, `write` does not.
+
+Even then, any grantee can write any task's status. The audit catches illegal transitions, and the admin can find who made each push with `GET /repos/{lock_repo}/activity`, which records the actor of every ref update (git commit authors are not authenticated). Revoking access (`DELETE /repos/{lock_repo}/collaborators/{u}`) is a human decision. The admin does not do it automatically.
 
 ## 7. Failure matrix
 
@@ -334,6 +391,9 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 | GitHub outage or rate limit | Git and API errors | Nothing transitions; timers restart afterwards; everything resumes |
 | Admin down | — | Nothing merges or expires; workers keep working; no state lost |
 | Admin crashes between merge and accept | Next sweep | PR already merged → `accept` |
+| Admin crashes in the middle of an access request | Next sweep | Re-derived from permission, invitations and issue comments; `PUT` again is a no-op |
+| Access invitation not accepted within 7 days | Admin sweep sees `expired` | Re-invite, at most 3 times, then close the issue |
+| Over 50 invitations in a day | `PUT` fails | Issues stay open; later sweeps continue |
 | PR closed by a human | Admin sweep | `rework` |
 | Task deleted from the tree | Admin sync | Close its PR, delete the lock branch (a human edit of the task set, outside the model) |
 | Bad self-update | Self-test, start guard | Rolled back to the previous binary |
@@ -343,7 +403,7 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 **Escalation.** No new states; only policy on `strikes` and `rounds`.
 
 1. Cooldown: a task is skipped for `min(5 min × 2^strikes, 6 h)` after its last failure. Advisory, so clock skew is harmless.
-2. `strikes ≥ 3`: the next claimant gets a triage prompt with all previous debug reports. It either does the task or opens a PR against the tasks repo that splits it. Merging that PR completes the parent and publishes the children.
+2. `strikes ≥ 3`: the next claimant gets a triage prompt with all previous debug reports. It either does the task or opens a PR against the tasks repo that splits it. Merging that PR removes the parent from the tree and adds the children.
 3. `strikes ≥ 6`, or three review rounds ending in "changes": the admin labels the task `needs-human`. It stays claimable at low weight.
 
 ## 8. What you were missing
@@ -365,7 +425,8 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 15. **Self-update is remote code execution** for whoever can push the project config. Pin by hash on a protected branch.
 16. **Secrets in debug reports.** Transcripts must be redacted before they are published.
 17. **Server mode needs** per-worker bearer tokens, TLS and SQLite backups, and it is a single point of failure that GitHub mode does not have.
-18. **Scale limit of GitHub mode.** One ref per task works for thousands of tasks; tens of thousands make `ls-remote` slow. That is the point to switch to the server.
+18. **Onboarding is a write grant to anyone who asks** in `auto` mode. Section 6 lists what must be protected first; for a public repo, `approve` is the safer default.
+19. **Scale limit of GitHub mode.** One ref per task works for thousands of tasks; tens of thousands make `ls-remote` slow. That is the point to switch to the server.
 
 ## 9. Size and build order
 
@@ -374,7 +435,7 @@ The reference project is about 200,000 lines of Python. This design should be ab
 1. `step` in the implementation language, tested against traces generated from the Lean model.
 2. GitHub backend (`snapshot`, `submit`, `changes`) with a two-process race test.
 3. Worker with a fake agent (a script that writes `result.json`), including kill-at-every-journal-step tests.
-4. Admin reconciler.
+4. Admin reconciler, including access requests.
 5. Real agent adapter, container, verify loop.
 6. Server backend.
 7. Install, self-update, rollback.

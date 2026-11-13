@@ -26,9 +26,12 @@ What is exercised, always with real pushes:
 3. **Every denied update, at the git level.** After each accepted transition, a second
    client that read the same state tries every transition that was legal in that state.
    Git must reject all of them, in both push modes.
-4. **Ref-level denials.** Publishing an existing task, wrong expected tip, unrelated
-   history; and (local remote only) forced rewrite and deletion.
-5. **A real race.** Several clients claim the same task concurrently: exactly one wins.
+4. **Ref-level denials.** Creating a lock branch that already exists, wrong expected tip,
+   unrelated history; and (local remote only) forced rewrite and deletion.
+5. **A real race.** Several clients claim the same unclaimed task concurrently, each
+   creating its lock branch: exactly one wins.
+
+An unclaimed task has no lock branch; its first claim creates it.
 6. **End to end.** The 20-event "nothing fails" trace and a zombie scenario, one push per
    event, a separate object store per worker, then an audit of the whole branch.
 -/
@@ -103,7 +106,7 @@ def probes (t : Task) (h : Worker) : List (String × Option Event) :=
 
 structure St where
   name    : String
-  /-- Events that build this state from a freshly published task. -/
+  /-- Events that build this state from an unclaimed task (no lock branch). -/
   path    : List Event
   /-- The state, written out. Fields: need, epoch, lease, pr, author, strikes. -/
   task    : Task
@@ -115,7 +118,7 @@ structure St where
   deriving Inhabited
 
 def states : Array St := #[
-  { name := "published", path := [], actor := 1,
+  { name := "unclaimed", path := [], actor := 1,
     task := ⟨.work, 0, none, none, none, 0⟩,
     accepts := [
       (L.claimNew, ⟨.work, 1, some 9, none, none, 0⟩),
@@ -168,7 +171,7 @@ def states : Array St := #[
 /-- One (state, event) pair. -/
 structure Case where
   st    : St
-  seed  : String        -- tip commit of the branch holding `st`
+  seed  : Option String -- tip commit of the branch holding `st`; `none` = no branch
   idx   : Nat
   label : String
   ev    : Event
@@ -197,16 +200,10 @@ def needName : Need → String
 
 def pad (s : String) (n : Nat) : String := s ++ String.ofList (List.replicate (n - s.length) ' ')
 
-/-- Build one branch per state by pushing its path one event at a time. -/
-def buildSeeds (x : Ctx) : IO (Array (St × String)) := do
-  let mut cur : Array (String × Task) := #[]
-  let mut ups : Array Upd := #[]
-  for s in states do
-    let sha ← x.a.commit Task.init none (← x.a.publishMsg)
-    cur := cur.push (sha, Task.init)
-    ups := ups.push ⟨x.a.ref s!"seed/{s.name}", none, some sha⟩
-  for ok in ← x.a.push .lease ups do
-    x.tally.check ok "publish (create-only push) accepted"
+/-- Build one branch per state by pushing its path one event at a time. The first event
+creates the branch; the unclaimed state has none. -/
+def buildSeeds (x : Ctx) : IO (Array (St × Option String)) := do
+  let mut cur : Array (Option String × Task) := states.map fun _ => (none, Task.init)
   let depth := states.foldl (fun m s => max m s.path.length) 0
   for d in [0:depth] do
     let mut stepUps : Array Upd := #[]
@@ -218,9 +215,9 @@ def buildSeeds (x : Ctx) : IO (Array (St × String)) := do
         match step t ev with
         | none => x.tally.check false s!"seed {s.name}: path event {repr ev} denied by the model"
         | some t' =>
-          let sha' ← x.a.commit t' (some sha) (← x.a.eventMsg ev)
-          stepUps := stepUps.push ⟨x.a.ref s!"seed/{s.name}", some sha, some sha'⟩
-          next := next.set! i (sha', t')
+          let sha' ← x.a.commit t' sha (← x.a.eventMsg ev)
+          stepUps := stepUps.push ⟨x.a.ref s!"seed/{s.name}", sha, some sha'⟩
+          next := next.set! i (some sha', t')
     for ok in ← x.a.push .lease stepUps do
       x.tally.check ok s!"seed step {d} accepted"
     cur := next
@@ -230,16 +227,19 @@ def buildSeeds (x : Ctx) : IO (Array (St × String)) := do
   for i in [0:states.size] do
     let s := states[i]!
     let (sha, _) := cur[i]!
-    match snap.find? (·.1 == s!"seed/{s.name}") with
-    | some (_, sn) =>
+    match snap.find? (·.1 == s!"seed/{s.name}"), sha with
+    | some (_, sn), some _ =>
       x.tally.check (sn.rev == sha) s!"seed {s.name}: reader sees the pushed tip"
       x.tally.check (sn.val == s.task) s!"seed {s.name}: status on the remote is the hand-written state"
-      x.tally.check ((← x.r.audit sn.rev).isEmpty) s!"seed {s.name}: history is a legal run"
-    | none => x.tally.check false s!"seed {s.name}: missing from snapshot"
+      x.tally.check ((← x.r.audit sn.rev.get!).isEmpty) s!"seed {s.name}: history is a legal run"
+    | none, none =>
+      let sn ← x.r.read s!"seed/{s.name}"
+      x.tally.check (sn.rev.isNone && sn.val == s.task) s!"seed {s.name}: no branch reads as unclaimed"
+    | _, _ => x.tally.check false s!"seed {s.name}: snapshot disagrees with what was pushed"
     res := res.push (s, sha)
   return res
 
-def allCases (seeds : Array (St × String)) : Array Case := Id.run do
+def allCases (seeds : Array (St × Option String)) : Array Case := Id.run do
   let mut cs := #[]
   for (s, sha) in seeds do
     let mut i := 0
@@ -249,13 +249,14 @@ def allCases (seeds : Array (St × String)) : Array Case := Id.run do
       i := i + 1
   return cs
 
-/-- Create one fresh branch per case, all pointing at that case's state. One push. -/
-def fork (x : Ctx) (names : Array (String × String)) : IO Unit := do
-  let ups := names.map fun (name, sha) => (⟨x.a.ref name, none, some sha⟩ : Upd)
+/-- Create one fresh branch per case, all pointing at that case's state. One push.
+Cases in the unclaimed state get no branch. -/
+def fork (x : Ctx) (names : Array (String × Option String)) : IO Unit := do
+  let ups := names.filterMap fun (name, sha) => sha.map fun s => (⟨x.a.ref name, none, some s⟩ : Upd)
   for ok in ← x.a.push .lease ups do
     x.tally.check ok "fork (create-only push) accepted"
 
-def printMatrix (seeds : Array (St × String)) : IO Unit := do
+def printMatrix (seeds : Array (St × Option String)) : IO Unit := do
   IO.println ""
   IO.println <| pad "" 28 ++ String.join (states.toList.map fun s => pad s.name 14)
   let labels := (probes Task.init 1).map (·.1)
@@ -291,8 +292,8 @@ def ruleMatrix (x : Ctx) (cases : Array Case) : IO (Nat × Nat) := do
     fork x (acc.map fun c => (name c, c.seed))
     let mut ups : Array Upd := #[]
     for c in acc do
-      let sha ← x.a.commit c.want.get! (some c.seed) (← x.a.eventMsg c.ev)
-      ups := ups.push ⟨x.a.ref (name c), some c.seed, some sha⟩
+      let sha ← x.a.commit c.want.get! c.seed (← x.a.eventMsg c.ev)
+      ups := ups.push ⟨x.a.ref (name c), c.seed, some sha⟩
     let rs ← x.a.push mode ups
     let tips ← x.r.tips
     x.r.fetchAll
@@ -313,7 +314,7 @@ def ruleMatrix (x : Ctx) (cases : Array Case) : IO (Nat × Nat) := do
     x.tally.check (res == .denied) s!"honest client refuses: {c.st.name} / {c.label}"
   let after ← x.r.tips
   for (s, sha) in (cases.map fun c => (c.st, c.seed)) do
-    x.tally.check (tipOf before s!"seed/{s.name}" == some sha && tipOf after s!"seed/{s.name}" == some sha)
+    x.tally.check (tipOf before s!"seed/{s.name}" == sha && tipOf after s!"seed/{s.name}" == sha)
       s!"{s.name}: branch did not move"
   -- denied pairs, misbehaving client: writes the commit anyway (status unchanged, event
   -- recorded). Git has no way to know; the audit must flag exactly this commit.
@@ -321,8 +322,8 @@ def ruleMatrix (x : Ctx) (cases : Array Case) : IO (Nat × Nat) := do
   fork x (den.map fun c => (name c, c.seed))
   let mut ups : Array Upd := #[]
   for c in den do
-    let sha ← x.b.commit c.st.task (some c.seed) (← x.b.eventMsg c.ev)
-    ups := ups.push ⟨x.b.ref (name c), some c.seed, some sha⟩
+    let sha ← x.b.commit c.st.task c.seed (← x.b.eventMsg c.ev)
+    ups := ups.push ⟨x.b.ref (name c), c.seed, some sha⟩
   let rs ← x.b.push .lease ups
   x.r.fetchAll
   for i in [0:den.size] do
@@ -349,10 +350,10 @@ def staleMatrix (x : Ctx) (cases : Array Case) : IO Nat := do
     let mut second : Array Upd := #[]
     for p in pairs do
       let (c₁, c₂) := p
-      let s₁ ← x.a.commit c₁.want.get! (some c₁.seed) (← x.a.eventMsg c₁.ev)
-      let s₂ ← x.b.commit c₂.want.get! (some c₂.seed) (← x.b.eventMsg c₂.ev)
-      first := first.push ⟨x.a.ref (name p), some c₁.seed, some s₁⟩
-      second := second.push ⟨x.b.ref (name p), some c₂.seed, some s₂⟩
+      let s₁ ← x.a.commit c₁.want.get! c₁.seed (← x.a.eventMsg c₁.ev)
+      let s₂ ← x.b.commit c₂.want.get! c₂.seed (← x.b.eventMsg c₂.ev)
+      first := first.push ⟨x.a.ref (name p), c₁.seed, some s₁⟩
+      second := second.push ⟨x.b.ref (name p), c₂.seed, some s₂⟩
     let r₁ ← x.a.push mode first
     let r₂ ← x.b.push mode second
     let tips ← x.r.tips
@@ -366,14 +367,15 @@ def staleMatrix (x : Ctx) (cases : Array Case) : IO Nat := do
   return total
 
 /-- Section 4: denials that are about the ref, not about a transition. -/
-def refDenials (x : Ctx) (seeds : Array (St × String)) : IO Unit := do
-  let some (_, pubSha) := seeds.find? (·.1.name == "published") | return
-  let some (_, doneSha) := seeds.find? (·.1.name == "done") | return
-  let root ← x.b.commit Task.init none (← x.b.publishMsg)
-  let child ← x.b.commit ⟨.work, 1, some 9, none, none, 0⟩ (some pubSha) (← x.b.eventMsg (.claim 9 0))
-  let r ← x.b.push .lease #[⟨x.b.ref "seed/published", none, some root⟩]
-  x.tally.check (!r[0]!) "publishing a task that already exists is rejected (create-only)"
-  let r ← x.b.push .lease #[⟨x.b.ref "seed/published", some doneSha, some child⟩]
+def refDenials (x : Ctx) (seeds : Array (St × Option String)) : IO Unit := do
+  let some (_, some workSha) := seeds.find? (·.1.name == "work") | return
+  let some (_, some doneSha) := seeds.find? (·.1.name == "done") | return
+  -- a first claim, as if the task were unclaimed
+  let root ← x.b.commit ⟨.work, 1, some 9, none, none, 0⟩ none (← x.b.eventMsg (.claim 9 0))
+  let child ← x.b.commit ⟨.work, 2, some 9, none, none, 1⟩ (some workSha) (← x.b.eventMsg (.claim 9 1))
+  let r ← x.b.push .lease #[⟨x.b.ref "seed/work", none, some root⟩]
+  x.tally.check (!r[0]!) "creating a lock branch that already exists is rejected (create-only)"
+  let r ← x.b.push .lease #[⟨x.b.ref "seed/work", some doneSha, some child⟩]
   x.tally.check (!r[0]!) "a correct child commit with the wrong expected tip is rejected"
   let r ← x.b.push .ffOnly #[⟨x.b.ref "seed/done", none, some root⟩]
   x.tally.check (!r[0]!) "plain push of unrelated history is rejected (not a fast-forward)"
@@ -385,7 +387,7 @@ def refDenials (x : Ctx) (seeds : Array (St × String)) : IO Unit := do
   else
     IO.println "  skipped: forced rewrite / deletion (needs a ruleset on the remote)"
   let tips ← x.r.tips
-  x.tally.check (tipOf tips "seed/published" == some pubSha && tipOf tips "seed/done" == some doneSha)
+  x.tally.check (tipOf tips "seed/work" == some workSha && tipOf tips "seed/done" == some doneSha)
     "branches are untouched after the rejected pushes"
 
 /-- Section 5: a real concurrent race. -/
@@ -397,12 +399,10 @@ def liveRace (x : Ctx) (n rounds : Nat) : IO Nat := do
   for mode in [Mode.lease, Mode.ffOnly] do
     for round in [0:rounds] do
       let task := s!"race/{mode.label}/{round}"
-      x.tally.check ((← x.a.publish task) matches .won _) "race: publish"
       let mut snaps := #[]
       for c in clients do
-        match ← c.read task with
-        | some s => snaps := snaps.push s
-        | none => throw <| IO.userError "race: task not readable"
+        snaps := snaps.push (← c.read task)
+      x.tally.check (snaps.all (·.rev.isNone)) "race: the task starts with no lock branch"
       let mut jobs := #[]
       for i in [0:n] do
         jobs := jobs.push (← IO.asTask (prio := .dedicated)
@@ -417,11 +417,11 @@ def liveRace (x : Ctx) (n rounds : Nat) : IO Nat := do
       let what := s!"race {mode.label} #{round}"
       x.tally.check (winners.size == 1) s!"{what}: exactly one of {n} concurrent claims wins (got {winners})"
       x.tally.check (lost == n - 1) s!"{what}: every other claim is rejected by git"
-      match ← x.r.read task with
-      | some s =>
-        x.tally.check (s.val.lease == winners[0]? && s.val.epoch == 1) s!"{what}: the lease belongs to the winner"
-        x.tally.check ((← x.r.audit s.rev).isEmpty) s!"{what}: history is a legal run"
-      | none => x.tally.check false s!"{what}: unreadable"
+      let s ← x.r.read task
+      x.tally.check (s.val.lease == winners[0]? && s.val.epoch == 1) s!"{what}: the lease belongs to the winner"
+      match s.rev with
+      | some rev => x.tally.check ((← x.r.audit rev).isEmpty) s!"{what}: history is a legal run"
+      | none => x.tally.check false s!"{what}: no lock branch after the race"
       races := races + 1
   return races
 
@@ -447,29 +447,23 @@ def endToEnd (x : Ctx) : IO Nat := do
   let mut pushes := 0
   for mode in [Mode.lease, Mode.ffOnly] do
     let task := s!"trace/{mode.label}"
-    x.tally.check ((← who[0]!.publish task) matches .won _) "trace: publish"
     for ev in trace do
       let c := who[actorOf ev]!
-      match ← c.read task with
-      | some s =>
-        x.tally.check ((← c.submit mode task s ev) matches .won _) s!"trace {mode.label}: {repr ev}"
-        pushes := pushes + 1
-      | none => x.tally.check false "trace: unreadable"
-    match ← x.r.read task with
-    | some s =>
-      x.tally.check (s.val == ⟨.done, 9, none, some 8, some 2, 2⟩) s!"trace {mode.label}: final status"
-      x.tally.check ((← x.r.audit s.rev).isEmpty) s!"trace {mode.label}: 21 commits form a legal run"
-    | none => x.tally.check false "trace: unreadable"
+      let s ← c.read task
+      x.tally.check ((← c.submit mode task s ev) matches .won _) s!"trace {mode.label}: {repr ev}"
+      pushes := pushes + 1
+    let s ← x.r.read task
+    x.tally.check (s.val == ⟨.done, 9, none, some 8, some 2, 2⟩) s!"trace {mode.label}: final status"
+    x.tally.check ((← x.r.audit s.rev.get!).isEmpty) s!"trace {mode.label}: 20 commits form a legal run"
   -- zombie: w1 holds a lease, the admin expires it, w1 comes back
   let task := "trace/zombie"
   let admin := who[0]!
   let w1 := who[1]!
   let w2 := who[2]!
-  x.tally.check ((← admin.publish task) matches .won _) "zombie: publish"
-  let s₀ ← (← w1.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let s₀ ← w1.read task
   x.tally.check ((← w1.submit .lease task s₀ (.claim 1 0)) matches .won _) "zombie: w1 claims"
-  let held ← (← w1.read task).getDM (throw <| IO.userError "zombie: unreadable")
-  let seen ← (← admin.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let held ← w1.read task
+  let seen ← admin.read task
   x.tally.check ((← admin.submit .lease task seen (.expire 1)) matches .won _) "zombie: admin expires w1"
   -- w1 still believes it holds the lease and reports on its old snapshot: git rejects
   x.tally.check ((← w1.submit .lease task held (.report 1 1 (.success 7))) == .lost)
@@ -477,22 +471,22 @@ def endToEnd (x : Ctx) : IO Nat := do
   x.tally.check ((← w1.submit .ffOnly task held (.report 1 1 (.success 7))) == .lost)
     "zombie: report on the pre-expiry snapshot is rejected by git (ff-only mode)"
   -- w1 re-reads: now the rule itself denies its old token
-  let s₁ ← (← w1.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let s₁ ← w1.read task
   x.tally.check ((← w1.submit .lease task s₁ (.report 1 1 (.success 7))) == .denied)
     "zombie: after re-reading, the old token is denied by the rules"
   -- another worker takes over and finishes; w1's old token stays dead
-  let v ← (← w2.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let v ← w2.read task
   x.tally.check ((← w2.submit .lease task v (.claim 2 1)) matches .won _) "zombie: w2 claims"
-  let s₂ ← (← w1.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let s₂ ← w1.read task
   x.tally.check ((← w1.submit .lease task s₂ (.report 1 1 (.success 7))) == .denied)
     "zombie: w1's old token is denied while w2 holds the lease"
-  let v ← (← w2.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let v ← w2.read task
   x.tally.check ((← w2.submit .lease task v (.report 2 2 (.success 7))) matches .won _) "zombie: w2 reports"
   -- the author cannot review its own PR
-  let v ← (← w2.read task).getDM (throw <| IO.userError "zombie: unreadable")
+  let v ← w2.read task
   x.tally.check ((← w2.submit .lease task v (.claim 2 2)) == .denied) "zombie: author may not claim the review"
   x.tally.check (v.val == ⟨.review, 2, none, some 7, some 2, 1⟩) "zombie: final status"
-  x.tally.check ((← w2.audit v.rev).isEmpty) "zombie: history is a legal run"
+  x.tally.check ((← w2.audit v.rev.get!).isEmpty) "zombie: history is a legal run"
   return pushes
 
 def cleanup (x : Ctx) : IO Unit := do
