@@ -74,7 +74,10 @@ def test_github_mode_full_lifecycle(world):
 
     assert any("merged and accepted" in a for a in admin.sweep())
     assert status(world, "demo/a").core.need is Need.DONE
-    assert any("wrote done/demo/a.json" in a for a in admin.sweep())
+    acts = admin.sweep()
+    assert "demo/a: deleted branch task/demo/a/e1 of merged PR #1" in acts
+    assert any("wrote done/demo/a.json" in a for a in acts)
+    assert git("for-each-ref", "--format=%(refname)", "refs/heads/task/", cwd=world.code_repo) == ""
     assert any("deleted lock branch" in a for a in admin.sweep())  # grace is 0 in the test fleet
     assert lock_branches(world) == []
     assert git("cat-file", "-e", "main:done/demo/a.json", cwd=world.config_repo) == ""
@@ -248,3 +251,25 @@ def test_stalled_agent_is_killed_and_reported(world, mode):
     st = status(world, "demo/a")
     assert st.core.lease is None and st.core.strikes == 1
     assert st.last["agent"]["reason"] == "stall"
+
+
+def test_admin_deletes_branches_of_merged_and_superseded_prs_but_not_open_ones(world):
+    forge = FakeForge()
+    a = make_worker(world, "alice", "work", forge)
+    b = make_worker(world, "bob", "changes", forge)
+    assert a.run_once() and b.run_once()
+    forge.prs[1]["state"] = "closed"  # closed by hand: the fix opens PR #2 on a new branch
+    assert a.run_once()
+    admin = make_admin(world, forge)
+    branches = lambda: git("for-each-ref", "--format=%(refname:short)", "refs/heads/task/", cwd=world.code_repo)
+    assert sorted(branches().split()) == ["task/demo/a/e1", "task/demo/a/e3"]
+    admin.sweep()
+    assert sorted(branches().split()) == ["task/demo/a/e1", "task/demo/a/e3"]  # nothing retired yet
+    approve = make_worker(world, "bob", "approve", forge)
+    assert approve.run_once()
+    admin.sweep()  # merges #2
+    acts = admin.sweep()  # retires: both PR branches go
+    assert "demo/a: deleted branch task/demo/a/e1 of closed PR #1" in acts
+    assert "demo/a: deleted branch task/demo/a/e3 of merged PR #2" in acts
+    assert branches() == ""
+    assert not any("deleted branch" in x for x in admin.sweep())  # idempotent

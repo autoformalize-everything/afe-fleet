@@ -67,6 +67,7 @@ class FakeForge(Forge):
     reviews: list[tuple] = field(default_factory=list)
     checks: str = "success"
     mergeable: bool | None = True
+    deleted: list = field(default_factory=list)
 
     def login(self):
         return None
@@ -110,6 +111,17 @@ class FakeForge(Forge):
 
     def comment(self, pr, body):
         self.prs[pr["number"]].setdefault("comments", []).append(body)
+
+    def closed_prs(self, repo, branch_prefix):
+        return [{"repo": repo, "number": n, "branch": p["branch"], "head_repo": repo,
+                 "merged": p["state"] == "merged"}
+                for n, p in self.prs.items() if p["state"] != "open" and p["branch"].startswith(branch_prefix)]
+
+    def delete_branch(self, repo, branch):
+        p = subprocess.run(["git", "update-ref", "-d", f"refs/heads/{branch}"], cwd=repo, capture_output=True)
+        existed = p.returncode == 0 and branch not in self.deleted
+        self.deleted.append(branch)
+        return existed
 
     def open_prs(self, repo, branch_prefix):
         return [{"repo": repo, "number": n, "branch": p["branch"], "url": f"pr/{n}"}

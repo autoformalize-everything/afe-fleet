@@ -51,6 +51,15 @@ class Forge:
         """Open PRs whose head branch starts with `branch_prefix`: [{"number", "branch", "url"}]."""
         ...
 
+    def closed_prs(self, repo: str, branch_prefix: str) -> list[dict]:
+        """Closed or merged PRs whose head branch starts with `branch_prefix`:
+        [{"number", "branch", "head_repo", "merged"}]."""
+        ...
+
+    def delete_branch(self, repo: str, branch: str) -> bool:
+        """Delete a branch; True if it existed and was deleted."""
+        ...
+
     # access requests (lock repo)
     def open_issues(self, repo: str) -> list[dict]: ...
     def issue_comments(self, repo: str, number: int) -> list[str]: ...
@@ -161,6 +170,20 @@ class GhForge(Forge):
         _, items = self.api(f"repos/{repo}/pulls?state=open&per_page=100")
         return [{"repo": repo, "number": p["number"], "branch": p["head"]["ref"], "url": p["html_url"]}
                 for p in items if p["head"]["ref"].startswith(branch_prefix)]
+
+    def closed_prs(self, repo: str, branch_prefix: str) -> list[dict]:
+        _, items = self.api(f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100")
+        return [{"repo": repo, "number": p["number"], "branch": p["head"]["ref"],
+                 "head_repo": (p["head"].get("repo") or {}).get("full_name"), "merged": bool(p.get("merged_at"))}
+                for p in items if p["head"]["ref"].startswith(branch_prefix)]
+
+    def delete_branch(self, repo: str, branch: str) -> bool:
+        code, _ = self.api(f"repos/{repo}/git/refs/heads/{branch}", method="DELETE", check=False)
+        if code == 204:
+            return True
+        if code in (404, 422):  # already gone
+            return False
+        raise ForgeError(f"delete branch {branch} in {repo}: HTTP {code}")
 
     def open_issues(self, repo: str) -> list[dict]:
         _, items = self.api(f"repos/{repo}/issues?state=open&per_page=100&sort=created&direction=asc")

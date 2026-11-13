@@ -259,16 +259,37 @@ class Admin:
             return [f"{task}: merged; accept will be retried"]
         return []
 
+    def _delete_pr_branches(self, v: AdminView) -> list[str]:
+        """Delete the head branches of this task's merged or closed PRs in the code repository.
+        Nothing is lost: GitHub keeps each PR's head reachable as refs/pull/<n>/head. Open PRs,
+        branches without a PR, and branches in forks are left alone. Idempotent."""
+        pr = v.status.core.pr
+        if not isinstance(pr, dict) or not pr.get("repo"):
+            return []
+        acts = []
+        for other in self.forge.closed_prs(pr["repo"], f"task/{v.task}/"):
+            if other.get("head_repo") not in (None, pr["repo"]):
+                continue
+            if self.forge.delete_branch(pr["repo"], other["branch"]):
+                acts.append(f"{v.task}: deleted branch {other['branch']} of "
+                            f"{'merged' if other.get('merged') else 'closed'} PR #{other['number']}")
+        return acts
+
     def _retire(self, tree: Tree, v: AdminView) -> list[str]:
         task = v.task
         lock = self.coord.lock
         cancelled = v.status.core.need is Need.CANCELLED
         d = "cancelled" if cancelled else "done"
+        try:
+            branch_acts = self._delete_pr_branches(v)
+        except ForgeError as e:
+            log.warning("%s: deleting PR branches: %s", task, e)
+            branch_acts = []
         if task not in (tree.cancelled if cancelled else tree.done):
             self.config.write_done(task, {"task": task, "status": v.status.to_json(), "lock_tip": v.rev,
                                           "at": self.wall()}, cancelled=cancelled)
             lock.archive(task, v.rev)
-            return [f"{task}: {d}; wrote {d}/{task}.json and archived"]
+            return branch_acts + [f"{task}: {d}; wrote {d}/{task}.json and archived"]
         raw = self.config.read_file(tree.rev, f"{d}/{task}.json")
         try:
             at = float(json.loads(raw)["at"])
@@ -277,8 +298,8 @@ class Admin:
         if self.wall() - at >= self.fleet.done_grace:
             lock.archive(task, v.rev)
             if self.coord.delete(v):
-                return [f"{task}: grace period over; deleted lock branch"]
-        return []
+                return branch_acts + [f"{task}: grace period over; deleted lock branch"]
+        return branch_acts
 
     # -- STATUS.md -----------------------------------------------------------------------------
 
