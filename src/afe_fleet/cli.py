@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -25,6 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, service, update
+from .capacity import SpareCapacity
 from .config import HostConfig, Loaded, fleet_home, load, source_store
 from .configrepo import ConfigRepo
 from .gitutil import repo_url
@@ -86,7 +88,7 @@ def cmd_worker(args) -> int:
         return HostConfig.load(loaded.fleet.name, Path(args.host_config) if args.host_config else None,
                                worker_id=args.id, gh_user=user, slots=args.slots,
                                kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter,
-                               model=args.model, effort=args.effort)
+                               model=args.model, effort=args.effort, spare_capacity=args.spare_capacity)
 
     host = host_config(gh_user)
     if host.gh_user is None:
@@ -116,10 +118,18 @@ def cmd_worker(args) -> int:
                 return False
             return True
 
+    capacity = None
+    if host.spare_capacity is not None:
+        capacity = SpareCapacity(host.agent.cli, host.spare_capacity, host.agent.usage_command or None,
+                                 exe=os.path.expanduser(host.agent.command[0]))
+        log.info("claiming only with spare %s capacity: max(used / elapsed) < %g", host.agent.cli,
+                 host.spare_capacity)
+
     def make(slot: int) -> Worker:
         coord, cfg = _coord(loaded, host.worker_id, slot)
         w = Worker(replace(loaded, config=cfg), host, coord, forge, slot=slot)
         w.maintain = maintain
+        w.capacity = capacity
         if args.once:
             w.idle = 0
         return w
@@ -244,6 +254,9 @@ def parser() -> argparse.ArgumentParser:
     wr.add_argument("--host-config", help="per-host config (default ~/.config/afe-fleet/<fleet>.toml)")
     wr.add_argument("--model", help="override the model for every task (e.g. fable-5.2, opus-5.5, sonnet-5.5)")
     wr.add_argument("--effort", help="override the effort level: low, medium, high, xhigh, max")
+    wr.add_argument("--spare-capacity", type=float, metavar="LIMIT",
+                    help="claim only while max(used / elapsed) over the agent subscription's rate-limit "
+                         "windows is below LIMIT (1 = no faster than the windows refill)")
     wr.add_argument("--once", action="store_true", help="one claim and attempt, then exit")
 
     a = sub.add_parser("admin", help="run the admin").add_subparsers(dest="action", required=True)

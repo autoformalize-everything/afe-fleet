@@ -108,6 +108,8 @@ class Worker:
         self.idle = 30.0
         self.infra_failures = 0
         self.maintain = None  # called before every claim: config reload, self-update, ...
+        self.capacity = None  # capacity.SpareCapacity: claim only with spare subscription capacity
+        self._spare: bool | None = None
 
     # -- main loop -----------------------------------------------------------------------------
 
@@ -139,6 +141,13 @@ class Worker:
             log.warning("two infrastructure failures in a row; backing off before claiming again")
             self.infra_failures = 0
             self.stop.wait(600)
+        if self.capacity is not None:
+            spare, why = self.capacity.check()
+            if spare != self._spare:
+                log.info("%s: %s", "spare capacity, claiming" if spare else "no spare capacity, not claiming", why)
+                self._spare = spare
+            if not spare:
+                return False
         nonce = secrets.token_hex(8)
         meta = {"worker": self.worker_id, "gh_user": self.host.gh_user, "nonce": nonce,
                 "claimed_at": now_iso(), "heartbeat_at": now_iso()}
@@ -261,7 +270,7 @@ class Worker:
 
     def _runtime(self, td: TaskDef, wt) -> Runtime:
         return Runtime(self.host.agent, td.project.get("image"), f"afe-fleet-{self.fleet.name}-{self.slot}",
-                       self.fleet.name, identity=(wt.git.name, wt.git.email))
+                       self.fleet.name, identity=(wt.git.name, wt.git.email), prepare=td.project.get("prepare"))
 
     def _write_task_files(self, ws: Workspace, lease: Lease, td: TaskDef, rev: str, kind: str) -> None:
         text = self.loaded.config.task_text(rev, td.id) if rev else ""  # per-slot ConfigRepo

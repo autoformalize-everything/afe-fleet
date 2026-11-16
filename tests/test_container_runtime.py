@@ -4,11 +4,13 @@ per-attempt container. The docker tests need a reachable daemon and alpine:lates
 import os
 import shutil
 import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from afe_fleet.agent import PLUGIN_DIR, Runtime, Workspace, run_verify
+from afe_fleet.agent import PLUGIN_DIR, Runtime, Verify, Workspace, run_agent, run_verify
 from afe_fleet.config import AgentConfig
 
 
@@ -73,6 +75,23 @@ def test_container_runtime_needs_an_image(tmp_path):
         Runtime(AgentConfig(runtime="container"), None, "n", "l").agent_argv(ws)
 
 
+def test_prepare_runs_in_the_worktree_before_the_agent(tmp_path):
+    ws, _ = worktree_workspace(tmp_path)
+    agent = "import pathlib, sys; sys.exit(0 if pathlib.Path('prepared').exists() else 7)"
+    cfg = AgentConfig(command=[sys.executable, "-c", agent])
+    rt = Runtime(cfg, None, "n", "l", prepare=["sh", "-c", "touch prepared"])
+    r = run_agent(rt, ws, "go", verify=lambda: Verify(True, ""), cancel=threading.Event(), repairs=0)
+    assert (ws.work / "prepared").exists() and r.reason == "exit" and r.exit_code == 0
+
+
+def test_failing_prepare_ends_the_attempt(tmp_path):
+    ws, _ = worktree_workspace(tmp_path)
+    cfg = AgentConfig(command=[sys.executable, "-c", "raise SystemExit('the agent must not start')"])
+    rt = Runtime(cfg, None, "n", "l", prepare=["sh", "-c", "echo no cache >&2; exit 3"])
+    r = run_agent(rt, ws, "go", verify=lambda: Verify(True, ""), cancel=threading.Event())
+    assert r.reason == "error" and "prepare failed (exit 3): no cache" in r.errors[0]
+
+
 def _docker_ok() -> bool:
     if not shutil.which("docker"):
         return False
@@ -84,13 +103,16 @@ def _docker_ok() -> bool:
 def test_container_lifecycle(tmp_path):
     ws, _ = worktree_workspace(tmp_path)
     cfg = AgentConfig(runtime="container")
-    rt = Runtime(cfg, "alpine:latest", f"afe-fleet-test-{os.getpid()}", "afe-fleet-test")
+    rt = Runtime(cfg, "alpine:latest", f"afe-fleet-test-{os.getpid()}", "afe-fleet-test",
+                 prepare=["sh", "-c", "test -f /etc/alpine-release && touch prepared"])
     rt.remove_strays()
     try:
         rt.start(ws)
         state = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", rt.name],
                                capture_output=True, text=True, check=True).stdout.split()
         assert state == ["true"]
+        # prepare ran inside the container, in the worktree, as us
+        assert (ws.work / "prepared").stat().st_uid == os.getuid()
         # the tools' view: the worktree at its own path, writable as us
         subprocess.run(["docker", "exec", rt.name, "sh", "-c", "touch made-inside && cat README"],
                        check=True, capture_output=True)

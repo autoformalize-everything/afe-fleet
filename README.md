@@ -78,7 +78,7 @@ The config repo:
 
 ```
 fleet.toml
-tasks/<project>/project.toml      repo, base, image, verify (nearest one above a task applies)
+tasks/<project>/project.toml      repo, base, image, verify, prepare (nearest one above a task applies)
 tasks/<task-id>/TASK.md           the task; a task is a directory with TASK.md and none below it
 tasks/<task-id>/task.toml         optional: deps = [...], kinds = ["work", "review"], priority,
                                   verify = [...], [agent] model/effort
@@ -120,6 +120,7 @@ slots = 2
 kinds = ["review", "work"]
 filters = ["zlib/*"]
 push = "fork"              # push work branches to your fork ("origin" if you can push upstream)
+# spare_capacity = 1.0     # claim only with spare subscription capacity (below)
 
 [agent]
 # Runs directly on this machine, as you, in a git worktree; it uses your normal Claude login.
@@ -131,6 +132,25 @@ repairs = 2
 # model = "opus-5.5"       # host default when the task and project say nothing
 # effort = "high"
 ```
+
+### Spare capacity
+
+`spare_capacity = L` in `[worker]` (or `worker run --spare-capacity L`) makes the worker claim
+only while the agent's subscription is used more slowly than its rate-limit windows refill:
+
+    max(used / elapsed for every window) < L
+
+`used` is the fraction of a window's limit spent and `elapsed` the fraction of the window
+passed, for every window the subscription reports (Claude: the 5-hour session, the week, and
+per-model weeks; Codex: its 5-hour and weekly windows). At `L = 1` the worker never spends
+faster than the clock; below 1 it leaves room for whoever else uses the account. A window with
+nothing used never blocks. Usage that cannot be read counts as no spare capacity. Running
+attempts are not interrupted; the check gates claims only, and readings are cached for five
+minutes across slots.
+
+Usage is read through the agent CLI, without a model request: a `/usage` message to `claude` in
+stream-json mode, or `account/rateLimits/read` to `codex app-server`. `[agent] usage_command`
+replaces that with a command printing the same JSON.
 
 ### Running the agent's tools in a container
 
@@ -156,7 +176,13 @@ image = "afe-c-agent:pilot"               # needs /bin/sh, base64 and git; bash 
 ```
 
 The image is pulled if missing. The container runs as your uid, so files in the worktree stay
-yours; `HOME` inside it is the attempt's empty `home/`. `--dangerously-skip-permissions` is not
+yours; `HOME` inside it is the attempt's empty `home/`.
+
+`project.toml` may name a `prepare` command (`prepare = ["sh", "scripts/setup.sh"]`): it runs
+once per attempt before the agent starts, in the worktree, where the tools run (inside the
+attempt's container in this mode, on the host otherwise). If it fails, the attempt ends as an
+error, like a container that cannot start. One use: point a project's package directory at a
+prebuilt, read-only copy baked into the image instead of downloading it per attempt. `--dangerously-skip-permissions` is not
 needed in this mode: the plugin allows the contained tools itself.
 
 ### Codex as the agent

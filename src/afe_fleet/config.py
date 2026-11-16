@@ -136,6 +136,7 @@ class AgentConfig:
     network: str = ""  # container runtime: --network of the attempt's container ("": docker's default)
     plugin_dir: str = ""  # container runtime: the container-tools plugin (default: the one shipped here)
     codex_exec_server: str = ""  # container runtime, codex: static exec-server binary (default: next to codex)
+    usage_command: list[str] = field(default_factory=list)  # prints the CLI's usage JSON (capacity.py)
     max_wall: float = 4 * 3600
     stall: float = 20 * 60
     repairs: int = 2
@@ -156,6 +157,8 @@ class HostConfig:
     allow_self_review: bool = False
     push: str = "origin"  # "origin" | "fork": where work branches are pushed
     git_protocol: str = "ssh"
+    # claim only while max(used / elapsed) over the subscription's windows is below this (capacity.py)
+    spare_capacity: float | None = None
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     @staticmethod
@@ -172,7 +175,7 @@ class HostConfig:
         for k, v in CODEX_DEFAULTS.get(cli_name, {}).items():
             setattr(agent, k, list(v))
         for k in ("runtime", "cli", "command", "mounts", "env", "docker_args", "repairs", "isolate_home",
-                  "model_args", "effort_args", "network", "plugin_dir", "codex_exec_server"):
+                  "model_args", "effort_args", "network", "plugin_dir", "codex_exec_server", "usage_command"):
             if k in a:
                 setattr(agent, k, a[k])
         agentchoice.validate(a, str(path))
@@ -189,12 +192,22 @@ class HostConfig:
             kinds=tuple(overrides.get("kinds") or w.get("kinds", ("review", "work"))),
             filters=tuple(overrides.get("filters") or w.get("filters", ())),
             allow_self_review=bool(w.get("allow_self_review", False)), push=w.get("push", "origin"),
-            git_protocol=w.get("git_protocol", "ssh"), agent=agent)
+            git_protocol=w.get("git_protocol", "ssh"), agent=agent,
+            spare_capacity=_positive(overrides.get("spare_capacity") or w.get("spare_capacity"),
+                                     f"{path}: [worker] spare_capacity"))
         if agent.runtime not in ("container", "docker", "local"):
             raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
         if agent.cli == "codex" and agent.runtime == "docker":
             raise ValueError(f"{path}: [agent] cli = codex needs runtime local or container")
         return host
+
+
+def _positive(v: object, what: str) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+        raise ValueError(f"{what} must be a positive number, not {v!r}")
+    return float(v)
 
 
 @dataclass

@@ -111,12 +111,13 @@ class AgentRun:
 
 class Runtime:
     def __init__(self, cfg: AgentConfig, image: str | None, name: str, label: str,
-                 identity: tuple[str, str] | None = None):
+                 identity: tuple[str, str] | None = None, prepare: list[str] | None = None):
         self.cfg = cfg
         self.image = image
         self.name = name  # container name; unique per worker slot
         self.label = label
         self.identity = identity  # (name, email) for the agent's commits in a container
+        self.prepare = prepare  # project.toml `prepare`: run in the worktree before the agent
 
     def paths(self, ws: Workspace) -> dict[str, str]:
         """Where the agent sees the task files and writes its result, for the prompt."""
@@ -245,18 +246,22 @@ class Runtime:
         return argv + (["resume", session, "-"] if session else ["-"])
 
     def start(self, ws: Workspace) -> None:
-        """Container runtime: create and start the attempt's container (pulling the image if
-        needed). Raises RuntimeError with docker's message when it cannot."""
-        if self.cfg.runtime != "container":
-            return
-        argv = ["docker", "run", "-d", *self._container_args(ws, self.name), "--entrypoint", "/bin/sh",
-                self.image, "-c", KEEPALIVE]
-        try:
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=900)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("docker run timed out") from None
-        if p.returncode != 0:
-            raise RuntimeError(f"docker run failed: {(p.stderr or p.stdout).strip()[-2000:]}")
+        """Before the agent: in the container runtime, create and start the attempt's container
+        (pulling the image if needed); then run the project's `prepare` command in the worktree,
+        where the tools run (in that container, else on this machine). Raises RuntimeError with
+        the failing command's output."""
+        if self.cfg.runtime == "container":
+            argv = ["docker", "run", "-d", *self._container_args(ws, self.name), "--entrypoint", "/bin/sh",
+                    self.image, "-c", KEEPALIVE]
+            _run_or_raise("docker run", argv, None, 900)
+        if self.prepare:
+            if not (isinstance(self.prepare, list) and all(isinstance(a, str) for a in self.prepare)):
+                raise RuntimeError("project.toml prepare must be a list of strings")
+            if self.cfg.runtime == "container":
+                argv, cwd = ["docker", "exec", "-w", str(ws.work), self.name, *self.prepare], None
+            else:
+                argv, cwd = list(self.prepare), ws.work
+            _run_or_raise("prepare", argv, cwd, 900)
 
     def stop(self) -> None:
         """Container runtime: remove the attempt's container. Never raises."""
@@ -289,6 +294,17 @@ class Runtime:
         if self.cfg.runtime in ("docker", "container"):
             for n in (self.name, self.name + "-verify"):
                 subprocess.run(["docker", "rm", "-f", n], capture_output=True, timeout=60)
+
+
+def _run_or_raise(what: str, argv: list[str], cwd: Path | None, timeout: float) -> None:
+    try:
+        p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{what} timed out") from None
+    except OSError as e:
+        raise RuntimeError(f"{what} could not run: {e}") from None
+    if p.returncode != 0:
+        raise RuntimeError(f"{what} failed (exit {p.returncode}): {(p.stderr + p.stdout).strip()[-2000:]}")
 
 
 def _git_common_dir(work: Path) -> Path | None:
@@ -352,7 +368,7 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
         rt.start(ws)
     except RuntimeError as e:
         rt.stop()
-        return AgentRun("error", None, errors=[f"cannot start the agent's container: {e}"])
+        return AgentRun("error", None, errors=[f"cannot start the attempt: {e}"])
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, start_new_session=True, text=True, bufsize=1)
@@ -544,7 +560,7 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
         rt.start(ws)
     except RuntimeError as e:
         rt.stop()
-        return AgentRun("error", None, errors=[f"cannot start the agent's container: {e}"])
+        return AgentRun("error", None, errors=[f"cannot start the attempt: {e}"])
     run = AgentRun("exit", None)
     start = time.monotonic()
     message, wrapped = prompt, False
