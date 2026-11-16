@@ -47,6 +47,7 @@ from pathlib import Path
 
 from .agentchoice import AgentChoice, cli_args
 from .config import AgentConfig
+from .events import NOWHERE, Events
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ class Runtime:
         self.label = label
         self.identity = identity  # (name, email) for the agent's commits in a container
         self.prepare = prepare  # project.toml `prepare`: run in the worktree before the agent
+        self.events: Events = NOWHERE  # the attempt's event log (events.py)
 
     def paths(self, ws: Workspace) -> dict[str, str]:
         """Where the agent sees the task files and writes its result, for the prompt."""
@@ -253,7 +255,8 @@ class Runtime:
         if self.cfg.runtime == "container":
             argv = ["docker", "run", "-d", *self._container_args(ws, self.name), "--entrypoint", "/bin/sh",
                     self.image, "-c", KEEPALIVE]
-            _run_or_raise("docker run", argv, None, 900)
+            with self.events.span("container-start", image=self.image):
+                _run_or_raise("docker run", argv, None, 900)
         if self.prepare:
             if not (isinstance(self.prepare, list) and all(isinstance(a, str) for a in self.prepare)):
                 raise RuntimeError("project.toml prepare must be a list of strings")
@@ -261,15 +264,17 @@ class Runtime:
                 argv, cwd = ["docker", "exec", "-w", str(ws.work), self.name, *self.prepare], None
             else:
                 argv, cwd = list(self.prepare), ws.work
-            _run_or_raise("prepare", argv, cwd, 900)
+            with self.events.span("prepare"):
+                _run_or_raise("prepare", argv, cwd, 900)
 
     def stop(self) -> None:
         """Container runtime: remove the attempt's container. Never raises."""
         if self.cfg.runtime == "container":
-            try:
-                subprocess.run(["docker", "rm", "-f", self.name], capture_output=True, timeout=120)
-            except (OSError, subprocess.TimeoutExpired) as e:
-                log.warning("could not remove container %s: %s", self.name, e)
+            with self.events.span("container-stop"):
+                try:
+                    subprocess.run(["docker", "rm", "-f", self.name], capture_output=True, timeout=120)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    log.warning("could not remove container %s: %s", self.name, e)
 
     def verify_argv(self, ws: Workspace, cmd: list[str]) -> tuple[list[str], Path]:
         if self.cfg.runtime == "local":
@@ -351,6 +356,43 @@ def _kill_group(proc: subprocess.Popen, grace: float = 10) -> None:
         proc.wait(30)
 
 
+def _detail(inp: object) -> str:
+    """What a tool call is about, in a line: the command, the file, or its description."""
+    if isinstance(inp, dict):
+        for k in ("command", "file_path", "notebook_path", "path", "pattern", "description", "prompt", "url"):
+            if isinstance(inp.get(k), str):
+                return inp[k].replace("\n", " ")[:160]
+    return ""
+
+
+def claude_tool_events(ev: Events, msg: dict) -> None:
+    """Tool spans from Claude's stream-json: a `tool_use` begins one, its `tool_result` ends it."""
+    content = (msg.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if msg.get("type") == "assistant" and c.get("type") == "tool_use":
+            ev.begin("tool", id=c.get("id"), name=c.get("name"), detail=_detail(c.get("input")))
+        elif msg.get("type") == "user" and c.get("type") == "tool_result":
+            ev.end("tool", id=c.get("tool_use_id"), error=bool(c.get("is_error")))
+
+
+def codex_tool_events(ev: Events, msg: dict) -> None:
+    """Tool spans from Codex's --json: an item that starts and completes (commands, patches, MCP
+    calls, searches) is one; messages and reasoning only complete."""
+    item = msg.get("item") if isinstance(msg.get("item"), dict) else None
+    if item is None or item.get("type") in ("agent_message", "reasoning"):
+        return
+    if msg.get("type") == "item.started":
+        detail = item.get("command") or ", ".join(str(c.get("path")) for c in item.get("changes") or []
+                                                  if isinstance(c, dict))
+        ev.begin("tool", id=item.get("id"), name=item.get("type"), detail=str(detail).replace("\n", " ")[:160])
+    elif msg.get("type") == "item.completed":
+        ev.end("tool", id=item.get("id"), status=item.get("status"), exit=item.get("exit_code"))
+
+
 def user_message(text: str) -> str:
     return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
 
@@ -369,12 +411,14 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
     except RuntimeError as e:
         rt.stop()
         return AgentRun("error", None, errors=[f"cannot start the attempt: {e}"])
+    ev = rt.events
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, start_new_session=True, text=True, bufsize=1)
     except OSError as e:
         rt.stop()
         return AgentRun("error", None, errors=[f"cannot start agent: {e}"])
+    ev.begin("agent", cli="claude")
 
     run = AgentRun("exit", None)
     last_output = [time.monotonic()]
@@ -395,7 +439,9 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
                     continue
                 if msg.get("type") == "system" and msg.get("subtype") == "init":
                     run.session_id = msg.get("session_id") or run.session_id
+                claude_tool_events(ev, msg)
                 if msg.get("type") == "result":
+                    ev.end("turn", cost=msg.get("total_cost_usd"), error=bool(msg.get("is_error")))
                     with turn_done:
                         results.append(msg)
                         turn_done.notify_all()
@@ -407,6 +453,7 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
 
     def send(text: str) -> bool:
         try:
+            ev.begin("turn")
             proc.stdin.write(user_message(text))
             proc.stdin.flush()
             return True
@@ -426,7 +473,9 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             if new_results:
                 seen = len(results)
                 run.turns = seen
-                run.verify = verify()
+                with ev.span("verify") as end:
+                    run.verify = verify()
+                    end["ok"] = run.verify.ok
                 if run.verify.ok or repairs <= 0 or wrapped:
                     proc.stdin.close()
                 else:
@@ -465,6 +514,7 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             except (ProcessLookupError, PermissionError):
                 pass
         t.join(10)
+        ev.end("agent", reason=run.reason, exit=proc.returncode, turns=run.turns)
         rt.stop()
     run.exit_code = proc.returncode
     return run
@@ -509,6 +559,7 @@ def _codex_turn(rt: Runtime, ws: Workspace, argv: list[str], env: dict[str, str]
                 if not isinstance(msg, dict):
                     continue
                 kind = msg.get("type")
+                codex_tool_events(rt.events, msg)
                 if kind == "thread.started":
                     turn.session_id = msg.get("thread_id") or turn.session_id
                 elif kind == "turn.completed":
@@ -564,9 +615,13 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
     run = AgentRun("exit", None)
     start = time.monotonic()
     message, wrapped = prompt, False
+    ev = rt.events
+    ev.begin("agent", cli="codex")
     try:
         while True:
+            ev.begin("turn")
             turn = _codex_turn(rt, ws, rt.codex_argv(extra, run.session_id), env, message, cancel, start, wrapped)
+            ev.end("turn", completed=turn.completed, exit=turn.exit_code, stop=turn.stop)
             run.exit_code = turn.exit_code
             run.session_id = turn.session_id or run.session_id
             if turn.error:
@@ -584,7 +639,9 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             if not turn.completed:  # exited without finishing the turn
                 break
             run.turns += 1
-            run.verify = verify()
+            with ev.span("verify") as end:
+                run.verify = verify()
+                end["ok"] = run.verify.ok
             if run.verify.ok or repairs <= 0 or wrapped or run.session_id is None:
                 break
             if time.monotonic() - start > cfg.max_wall:
@@ -593,5 +650,6 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             message = ("The verify command failed. Fix it, commit, and finish again.\n\n"
                        f"```\n{run.verify.log[-6000:]}\n```")
     finally:
+        ev.end("agent", reason=run.reason, exit=run.exit_code, turns=run.turns)
         rt.stop()
     return run

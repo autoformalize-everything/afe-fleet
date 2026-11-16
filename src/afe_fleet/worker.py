@@ -30,6 +30,7 @@ from .agent import Runtime, Verify, Workspace, run_agent, run_verify
 from .agentchoice import AgentChoice
 from .config import HostConfig, Loaded, fleet_home, id_slug, worker_home
 from .configrepo import TaskDef
+from .events import EventLog, Events
 from .coord import Coord, Fenced, GitCoord, Lease, ServerCoord, Unreachable, Want
 from .forge import Forge, ForgeError
 from .gitutil import GitError, repo_url
@@ -197,6 +198,17 @@ class Worker:
         self.maintain = None  # called before every claim: config reload, self-update, ...
         self.capacity = None  # capacity.SpareCapacity: claim only with spare subscription capacity
         self._spare: bool | None = None
+        self.events_log: EventLog | None = None  # the process's event log (events.py); None: none
+        self.idle_reason = "no-task"
+        self._ev_attempt: Events | None = None
+
+    @property
+    def ev(self) -> Events:
+        return Events(self.events_log, self.worker_id)
+
+    @property
+    def ev_attempt(self) -> Events:
+        return self._ev_attempt or self.ev
 
     # -- main loop -----------------------------------------------------------------------------
 
@@ -210,11 +222,13 @@ class Worker:
                 raise SystemExit(75) from e
             except Exception:  # noqa: BLE001 - the loop must survive anything
                 log.exception("round failed")
+                self.idle_reason = "error"
                 did = False
             if did:
                 self.idle = 30.0
             else:
-                self.stop.wait(self.idle)
+                with self.ev.span("idle", reason=self.idle_reason, planned=self.idle):
+                    self.stop.wait(self.idle)
                 self.idle = min(self.idle * 2, 900)
 
     def want(self) -> Want:
@@ -225,23 +239,30 @@ class Worker:
 
     def run_once(self) -> bool:
         if self.maintain is not None and self.maintain() is False:
+            self.idle_reason = "version"
             return False  # e.g. this version is too old to claim
         if self.infra_failures >= 2:
             log.warning("two infrastructure failures in a row; backing off before claiming again")
             self.infra_failures = 0
-            self.stop.wait(600)
+            with self.ev.span("idle", reason="backoff", planned=600):
+                self.stop.wait(600)
         if self.capacity is not None:
             spare, why = self.capacity.check()
             if spare != self._spare:
                 log.info("%s: %s", "spare capacity, claiming" if spare else "no spare capacity, not claiming", why)
                 self._spare = spare
             if not spare:
+                self.idle_reason = "capacity"
                 return False
         nonce = secrets.token_hex(8)
         meta = {"worker": self.worker_id, "gh_user": self.host.gh_user, "nonce": nonce,
                 "claimed_at": now_iso(), "heartbeat_at": now_iso()}
-        lease = self.coord.claim(self.want(), meta)
+        with self.ev.span("claim") as end:
+            lease = self.coord.claim(self.want(), meta)
+            if lease is not None:
+                end.update(task=lease.task, kind=lease.kind, epoch=lease.epoch)
         if lease is None:
+            self.idle_reason = "no-task"
             return False
         log.info("claimed %s (%s, epoch %d)", lease.task, lease.kind, lease.epoch)
         self.journal.write(step="claimed", task=lease.task, epoch=lease.epoch, kind=lease.kind, nonce=nonce,
@@ -301,6 +322,8 @@ class Worker:
         hb.start()
         repo = SharedRepo(repo_url(td.project["repo"], self.host.git_protocol))
         lease.extra["worktree"] = None
+        ev = self._ev_attempt = self.ev.bind(task=lease.task, epoch=lease.epoch, kind=lease.kind)
+        ev.begin("attempt")
         try:
             if lease.kind == "work":
                 self._work(lease, td, tree.rev, ws, cancel, repo)
@@ -309,11 +332,14 @@ class Worker:
         finally:
             cancel.set()
             hb.join(5)
-            if lease.extra.get("worktree") is not None:
-                repo.remove(lease.extra["worktree"])
-            archive_attempt(ws, self.state / "logs" / slug(lease.task),
-                            f"e{lease.epoch}-{lease.kind}-{id_slug(self.worker_id)}")
-            shutil.rmtree(ws.root, ignore_errors=True)
+            with ev.span("cleanup"):
+                if lease.extra.get("worktree") is not None:
+                    repo.remove(lease.extra["worktree"])
+                archive_attempt(ws, self.state / "logs" / slug(lease.task),
+                                f"e{lease.epoch}-{lease.kind}-{id_slug(self.worker_id)}")
+                shutil.rmtree(ws.root, ignore_errors=True)
+            ev.end("attempt", outcome=lease.extra.get("outcome") or ("fenced" if lease.extra.get("fenced") else "error"))
+            self._ev_attempt = None
 
     def _local_name(self, lease: Lease) -> str:
         """Namespace for this attempt's branch and refs in the shared clone (shared by every
@@ -381,6 +407,8 @@ class Worker:
         base = proj.get("base", "main")
         branch = f"task/{lease.task}/e{lease.epoch}"  # the name pushed for the PR
         local = self._local_name(lease)
+        ev = self.ev_attempt
+        ev.begin("fetch")
         repo.fetch()
         start = f"refs/remotes/origin/{base}"
         refs = []
@@ -391,8 +419,10 @@ class Worker:
             if repo.fetch_ref(prev["fetch"], prev["branch"], prev_ref):
                 start = prev_ref
                 refs.append(prev_ref)
-        wt = repo.add(ws.work, start, branch=local, refs=refs, name=self.host.gh_user or self.worker_id,
-                      email=f"{self.host.gh_user or 'afe-fleet'}@users.noreply.github.com")
+        ev.end("fetch")
+        with ev.span("worktree"):
+            wt = repo.add(ws.work, start, branch=local, refs=refs, name=self.host.gh_user or self.worker_id,
+                          email=f"{self.host.gh_user or 'afe-fleet'}@users.noreply.github.com")
         lease.extra["worktree"] = wt
         git = wt.git
         start_sha = git("rev-parse", "HEAD")
@@ -401,7 +431,10 @@ class Worker:
         if start != base_ref and git.run("merge-base", "--is-ancestor", base_ref, "HEAD").returncode != 0:
             # The base moved under an existing PR: merge it before the agent starts, so only a
             # real conflict costs the agent anything.
-            if git.run("merge", "--no-edit", base_ref).returncode == 0:
+            with ev.span("merge-base") as end:
+                merged = git.run("merge", "--no-edit", base_ref).returncode == 0
+                end["conflict"] = not merged
+            if merged:
                 notes = MERGED_NOTE.format(base=base)
             else:
                 files = git.run("diff", "--name-only", "--diff-filter=U").stdout.split()
@@ -412,6 +445,7 @@ class Worker:
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease))
 
         rt = self._runtime(td, wt)
+        rt.events = ev
         verify_cmd = td.meta.get("verify", proj.get("verify"))  # task.toml overrides project.toml
         paths = td.meta.get("paths", proj.get("paths"))  # what the task may change; None: anything
 
@@ -463,7 +497,9 @@ class Worker:
                 "kind": "infra" if infra else "task",
                 "detail": (result or {}).get("debug") or "; ".join(run.errors) or f"agent ended: {run.reason}",
                 "transcript_tail": self._tail(ws.transcript)})
-            self.coord.report(lease, Outcome("failure"), last)
+            with ev.span("report", outcome="failure"):
+                self.coord.report(lease, Outcome("failure"), last)
+            lease.extra["outcome"] = "failure"
             log.info("%s: failure (%s)", lease.task, run.reason)
             return
         self.infra_failures = 0
@@ -478,6 +514,7 @@ class Worker:
         reuse = (start != f"refs/remotes/origin/{base}" and isinstance(prev, dict)
                  and prev.get("repo") == proj["repo"] and prev.get("fetch") and prev.get("branch")
                  and self._pr_open(prev))
+        ev.begin("push")
         if reuse:
             p = git.run("push", "-q", f"--force-with-lease=refs/heads/{prev['branch']}:{start_sha}", prev["fetch"],
                         f"HEAD:refs/heads/{prev['branch']}")
@@ -492,11 +529,13 @@ class Worker:
             if p.returncode != 0 and git.run("ls-remote", "--exit-code", push_url,
                                              f"refs/heads/{branch}").returncode != 0:
                 raise GitError(["push", branch], p.returncode, p.stderr)
+        ev.end("push")
         self.journal.write(step="pushed", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease), sha=head)
         title = f"{lease.task}: {summary.splitlines()[0][:60]}" if summary else f"afe-fleet: {lease.task}"
         body = (f"Task `{lease.task}`, attempt {lease.epoch} by `{self.worker_id}` ({choice.describe()}).\n\n{summary}\n\n"
                 f"Verify: {'passed' if verify.ok else 'failed'}\n\n<!-- afe-fleet task={lease.task} epoch={lease.epoch} -->")
+        ev.begin("pr")
         try:
             pr = self.forge.ensure_pr(repo=proj["repo"], branch=branch, head_owner=owner, base=base,
                                       title=title, body=body, draft=not success)
@@ -520,8 +559,10 @@ class Worker:
                                        f"(attempt {lease.epoch} of `{lease.task}`).")
         except ForgeError as e:  # cosmetic: the admin also closes superseded PRs
             log.warning("%s: %s", lease.task, e)
+        ev.end("pr", number=pr.get("number"))
         self.journal.write(step="pr", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease), pr=pr)
+        ev.begin("report")
         if success:
             last["outcome"] = "success"
             self.coord.report(lease, Outcome("success", pr), last)
@@ -530,6 +571,8 @@ class Worker:
                                                   "detail": (result or {}).get("debug"),
                                                   "verify_log": verify.log[-4000:]})
             self.coord.report(lease, Outcome("part", pr), last)
+        ev.end("report", outcome=last["outcome"])
+        lease.extra["outcome"] = last["outcome"]
         log.info("%s: %s, PR %s", lease.task, last["outcome"], pr.get("url") or pr.get("number"))
 
     # -- review --------------------------------------------------------------------------------
@@ -540,15 +583,19 @@ class Worker:
         if not isinstance(pr, dict):
             raise Fenced(f"{lease.task}: review without a PR")
         proj = td.project
-        repo.fetch()  # origin/<base>, for diffs against the base
-        pr_ref = f"refs/{self._local_name(lease)}/pr"
-        sha = repo.fetch_ref(pr["fetch"], pr["branch"], pr_ref)
+        ev = self.ev_attempt
+        with ev.span("fetch"):
+            repo.fetch()  # origin/<base>, for diffs against the base
+            pr_ref = f"refs/{self._local_name(lease)}/pr"
+            sha = repo.fetch_ref(pr["fetch"], pr["branch"], pr_ref)
         if sha is None:
             raise GitError(["fetch", pr["branch"]], 1, f"cannot fetch the PR branch from {pr['fetch']}")
-        wt = repo.add(ws.work, sha, refs=[pr_ref])
+        with ev.span("worktree"):
+            wt = repo.add(ws.work, sha, refs=[pr_ref])
         lease.extra["worktree"] = wt
         self._write_task_files(ws, lease, td, rev, "review")
         rt = self._runtime(td, wt)
+        rt.events = ev
         base, approved = proj.get("base", "main"), pr.get("approved_sha")
         scoped = ""
         if approved and approved != sha and wt.git.run("merge-base", "--is-ancestor", approved, sha).returncode == 0:
@@ -567,10 +614,14 @@ class Worker:
         if verdict is not Verdict.ABSTAIN:
             body = summary + "".join(f"\n\n`{c.get('path')}:{c.get('line')}`: {c.get('body')}"
                                      for c in review.get("comments", []) if isinstance(c, dict))
-            self.forge.post_review(pr, sha, verdict.value, f"{body}\n\n_Reviewed by `{self.worker_id}` ({choice.describe()})._")
-        self.coord.review(lease, verdict, {"outcome": verdict.value, "worker": self.worker_id,
-                                           "summary": summary, "reviewed_sha": sha, "agent": choice.to_json(),
-                                           "comments": review.get("comments", [])})
+            with ev.span("review-post"):
+                self.forge.post_review(pr, sha, verdict.value,
+                                       f"{body}\n\n_Reviewed by `{self.worker_id}` ({choice.describe()})._")
+        with ev.span("report", outcome=verdict.value):
+            self.coord.review(lease, verdict, {"outcome": verdict.value, "worker": self.worker_id,
+                                               "summary": summary, "reviewed_sha": sha, "agent": choice.to_json(),
+                                               "comments": review.get("comments", [])})
+        lease.extra["outcome"] = verdict.value
         log.info("%s: review %s at %s", lease.task, verdict.value, sha[:8])
 
     # -- helpers -------------------------------------------------------------------------------

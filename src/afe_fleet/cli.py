@@ -28,6 +28,7 @@ from pathlib import Path
 from . import __version__, service, update
 from .capacity import SpareCapacity
 from .config import AlreadyRunning, HostConfig, Loaded, fleet_home, hold_lock, load, worker_home
+from .events import EventLog
 from .configrepo import ConfigRepo
 from .gitutil import repo_url
 
@@ -130,9 +131,12 @@ def cmd_worker(args) -> int:
         log.info("claiming only with spare %s capacity: used < %g × elapsed + %g × (1 − elapsed) + %g in every "
                  "window", host.agent.cli, host.spare_capacity, host.spare_ease_in, host.spare_allowance)
 
+    events = EventLog(fleet_home(loaded.fleet.name) / "events", host.worker_id)
+
     def make(slot: int) -> Worker:
         coord, cfg = _coord(loaded, host.worker_id, home / f"slot-{slot}")
         w = Worker(replace(loaded, config=cfg), host, coord, forge, slot=slot, slot_dir=home / f"slot-{slot}")
+        w.events_log = events
         w.maintain = maintain
         w.capacity = capacity
         if args.once:
@@ -169,6 +173,7 @@ def cmd_admin(args) -> int:
         log.error("%s", e)
         return 75
     adm = Admin(loaded, _admin_coord(loaded), _forge(args))
+    adm.ev = EventLog(fleet_home(loaded.fleet.name) / "events", "admin").bind("admin")
     log.info("afe-fleet %s admin for fleet %s (%s mode)", __version__, loaded.fleet.name, loaded.fleet.mode)
     if args.once:
         for a in adm.sweep():
@@ -202,6 +207,32 @@ def cmd_server(args) -> int:
         srv.serve_forever()
     except KeyboardInterrupt:
         srv.stop()
+    return 0
+
+
+# -- timeline ----------------------------------------------------------------------------------
+
+def cmd_timeline(args) -> int:
+    import json
+
+    from . import timeline
+    from .config import data_home
+    if args.events:
+        directory = Path(args.events)
+    else:
+        fleets = sorted(p.name for p in (data_home() / "fleets").glob("*") if (p / "events").is_dir())
+        name = args.fleet or (fleets[0] if len(fleets) == 1 else None)
+        if name is None:
+            raise ValueError(f"name the fleet with --fleet (fleets with event logs: {', '.join(fleets) or 'none'})")
+        directory = fleet_home(name) / "events"
+    events = timeline.read_events(directory, timeline.parse_time(args.since), timeline.parse_time(args.until))
+    if not events:
+        raise ValueError(f"no events in {directory}")
+    spans, instants = timeline.spans(events)
+    out = Path(args.output)
+    out.write_text(json.dumps(timeline.chrome_trace(spans, instants)))
+    print(timeline.summary(spans))
+    print(f"\nTrace: {out} ({len(spans)} spans); open it in https://ui.perfetto.dev or chrome://tracing")
     return 0
 
 
@@ -298,6 +329,13 @@ def parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="print the task table")
     st.add_argument("source")
 
+    tl = sub.add_parser("timeline", help="a trace of what workers spent their time on, from the event logs")
+    tl.add_argument("--fleet", help="the fleet's name (default: the only fleet with event logs on this host)")
+    tl.add_argument("--events", help="an events directory to read instead (e.g. one copied from another host)")
+    tl.add_argument("--since", help="from this time (ISO 8601, or seconds since the epoch)")
+    tl.add_argument("--until", help="up to this time")
+    tl.add_argument("-o", "--output", default="afe-fleet-trace.json", help="where to write the Chrome trace")
+
     sv = sub.add_parser("service", help="manage systemd user services").add_subparsers(dest="action", required=True)
     si = sv.add_parser("install", help="install, enable and start (idempotent)")
     si.add_argument("role", choices=service.ROLES)
@@ -321,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.verbose)
     try:
         return {"worker": cmd_worker, "admin": cmd_admin, "server": cmd_server, "status": cmd_status,
-                "service": cmd_service}[args.cmd](args)
+                "timeline": cmd_timeline, "service": cmd_service}[args.cmd](args)
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         log.error("%s", e)
         return 2

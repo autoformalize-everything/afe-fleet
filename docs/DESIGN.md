@@ -533,6 +533,7 @@ The reference project is about 200,000 lines of Python. This one is a Python pac
 | Shared clone with a worktree per attempt, file-locked across processes | `repocache.py` | done, tested (concurrent attempts, cross-process lock, crash cleanup) |
 | Container runtime: tools in a per-attempt container via the `container-tools` plugin | `agent.py`, `container-tools/` | done; lifecycle and verify tested with docker, one end-to-end attempt run by hand with the real agent CLI |
 | Codex as the agent CLI: per-turn supervisor, container runtime through `codex-exec-server` | `agent.py` | done; supervisor tested with a fake codex, one end-to-end attempt (with a repair turn) run by hand with real Codex |
+| Event log (spans per worker: idle, claim, attempt phases, agent turns, tool calls, verify) and `afe-fleet timeline` (Chrome trace, summary) | `events.py`, `timeline.py` | done; tested with the fake agents |
 | Spare capacity: claim only while, in every subscription window, `used < L·elapsed + ease_in·(1 − elapsed) + allowance` | `capacity.py`, `worker.py` | done; parsing, rule and reader protocols tested with fake CLIs, read live from claude and codex by hand |
 | Docker runtime (agent CLI in the container) | `agent.py` | deferred; code kept, unused |
 | Not yet: workspace checkpoints on heartbeat, resuming an agent session after a worker restart (the worker releases the lease instead), closing superseded PRs, repair commits for illegal writes, escalation labels | | |

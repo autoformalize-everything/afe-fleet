@@ -32,6 +32,7 @@ from .access import AccessRequests
 from .config import Loaded
 from .configrepo import ConfigRepo, Tree
 from .coord import AdminCoord, AdminView, GitAdmin, ServerAdmin
+from .events import NOWHERE
 from .forge import Forge, ForgeError
 from .gitutil import github_slug
 from .model import TERMINAL, Accept, Cancel, Expire, Need, Rework
@@ -59,6 +60,7 @@ class Admin:
         self.wall = wall
         self.t = Timers()
         self.stop = threading.Event()
+        self.ev = NOWHERE  # the admin's event log (events.py)
         self.access = None
         slug = github_slug(self.fleet.lock_repo or "")
         if isinstance(coord, GitAdmin) and slug and self.fleet.access_mode != "off":
@@ -66,10 +68,15 @@ class Admin:
 
     def run_forever(self) -> None:
         while not self.stop.is_set():
-            try:
-                self.sweep()
-            except Exception:  # noqa: BLE001 - the loop must survive anything
-                log.exception("sweep failed")
+            with self.ev.span("sweep") as end:
+                try:
+                    acts = self.sweep()
+                    end["actions"] = len(acts)
+                    for a in acts:
+                        self.ev.instant("action", task=a.split(":", 1)[0], text=a)
+                except Exception:  # noqa: BLE001 - the loop must survive anything
+                    log.exception("sweep failed")
+                    end["error"] = "sweep failed"
             self.stop.wait(self.fleet.poll)
 
     # -- the sweep -----------------------------------------------------------------------------

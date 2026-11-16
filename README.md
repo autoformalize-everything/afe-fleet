@@ -143,6 +143,24 @@ repairs = 2
 # effort = "high"
 ```
 
+### Where the time goes: the event log and timelines
+
+Every worker and admin process appends what it does to
+`~/.local/share/afe-fleet/fleets/<fleet>/events/<worker-id>-<date>.jsonl`: spans with a begin and
+an end (`idle` with its reason, `claim`, `attempt` with `fetch`, `worktree`, `merge-base`,
+`container-start`, `prepare`, `agent` › `turn` › `tool`, `verify`, `push`, `pr`, `report`,
+`review-post`, `cleanup`; the admin's `sweep` and its actions). Tool calls are timed as the
+agent's output stream reports them, the same way for Claude and Codex.
+
+```sh
+afe-fleet timeline [--fleet afe] [--since 2026-11-17T09:00Z] [-o trace.json]
+```
+
+prints where the time went (each worker's busy and idle time by reason, time per phase, the
+slowest tools, every attempt) and writes a Chrome trace: open it in https://ui.perfetto.dev or
+`chrome://tracing` for one row per worker slot. `--events DIR` reads logs copied from other
+hosts. Each attempt's transcripts are kept beside it, in `fleets/<fleet>/logs/`.
+
 ### Fewer review rounds
 
 Each "changes requested" costs an attempt and another review, so the worker removes the
