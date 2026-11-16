@@ -126,6 +126,7 @@ slots = 2
 kinds = ["review", "work"]
 filters = ["zlib/*"]
 push = "fork"              # push work branches to your fork ("origin" if you can push upstream)
+# max_open_prs = 2          # start no new work while 2 of this worker's PRs await review or merging
 # spare_capacity = 1.0     # claim only with spare subscription capacity (below)
 # spare_ease_in = 0.1      # ... with a head start after each window resets
 
@@ -139,6 +140,15 @@ repairs = 2
 # model = "opus-5.5"       # host default when the task and project say nothing
 # effort = "high"
 ```
+
+### Reviews before new work
+
+A claim always prefers a review, then work on an existing PR, then new work. But a worker cannot
+review its own PRs, so with nothing else to review it would keep opening new ones. `max_open_prs
+= N` in `[worker]` (or `worker run --max-open-prs N`) stops that: while N of the worker's own PRs
+(across its slots) await review or merging, it starts no new work. It still reviews and still
+continues tasks that already have a PR (changes requested, merge conflicts); otherwise it idles
+until its PRs move.
 
 ### Spare capacity
 

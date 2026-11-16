@@ -139,8 +139,10 @@ class Worker:
                 self.idle = min(self.idle * 2, 900)
 
     def want(self) -> Want:
+        base = self.host.worker_id  # the limit is the process's, across its slots
+        authors = (base,) if self.host.slots == 1 else tuple(f"{base}-{i}" for i in range(self.host.slots))
         return Want(self.worker_id, self.host.gh_user, self.host.kinds, self.host.filters,
-                    self.host.allow_self_review)
+                    self.host.allow_self_review, self.host.max_open_prs, authors)
 
     def run_once(self) -> bool:
         if self.maintain is not None and self.maintain() is False:

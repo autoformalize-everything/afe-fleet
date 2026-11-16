@@ -201,6 +201,8 @@ class HostConfig:
     spare_capacity: float | None = None
     spare_ease_in: float = 0.0
     spare_allowance: float = 0.0
+    # start no new work while this many of the worker's own PRs await review or merging (coord.Want)
+    max_open_prs: int | None = None
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     @staticmethod
@@ -240,7 +242,9 @@ class HostConfig:
             spare_ease_in=_fraction(_first(overrides.get("spare_ease_in"), w.get("spare_ease_in")),
                                     f"{path}: [worker] spare_ease_in"),
             spare_allowance=_fraction(_first(overrides.get("spare_allowance"), w.get("spare_allowance")),
-                                      f"{path}: [worker] spare_allowance"))
+                                      f"{path}: [worker] spare_allowance"),
+            max_open_prs=_count(_first(overrides.get("max_open_prs"), w.get("max_open_prs")),
+                                f"{path}: [worker] max_open_prs"))
         if agent.runtime not in ("container", "docker", "local"):
             raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
         if agent.cli == "codex" and agent.runtime == "docker":
@@ -258,6 +262,14 @@ def _positive(v: object, what: str) -> float | None:
 
 def _first(*vs: object) -> object:
     return next((v for v in vs if v is not None), None)
+
+
+def _count(v: object, what: str) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"{what} must be an integer ≥ 1, not {v!r}")
+    return v
 
 
 def _fraction(v: object, what: str) -> float:

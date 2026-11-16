@@ -85,7 +85,8 @@ def cmd_worker(args) -> int:
                                worker_id=args.id, gh_user=user, slots=args.slots,
                                kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter,
                                model=args.model, effort=args.effort, spare_capacity=args.spare_capacity,
-                               spare_ease_in=args.spare_ease_in, spare_allowance=args.spare_allowance)
+                               spare_ease_in=args.spare_ease_in, spare_allowance=args.spare_allowance,
+                               max_open_prs=args.max_open_prs)
 
     host = host_config(gh_user)
     if host.gh_user is None:
@@ -273,6 +274,9 @@ def parser() -> argparse.ArgumentParser:
                     help="head start right after a window resets, fading to 0 at its end (fraction of the limit)")
     wr.add_argument("--spare-allowance", type=float, metavar="ALLOWANCE",
                     help="constant margin over the pace line (fraction of the limit)")
+    wr.add_argument("--max-open-prs", type=int, metavar="N",
+                    help="start no new work while N of this worker's own PRs await review or merging "
+                         "(reviews and work on an existing PR continue)")
     wr.add_argument("--once", action="store_true", help="one claim and attempt, then exit")
 
     a = sub.add_parser("admin", help="run the admin").add_subparsers(dest="action", required=True)

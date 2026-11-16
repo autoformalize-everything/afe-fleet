@@ -55,6 +55,18 @@ class Want:
     kinds: tuple[str, ...] = ("review", "work")
     filters: tuple[str, ...] = ()  # glob patterns on task ids; empty = everything
     allow_self_review: bool = False
+    # Open PRs are a burden on reviewers: with a limit, no new work is started while this many of
+    # the worker's own PRs (authored under any of `authors`: its slots) await review or merging.
+    # Reviews and work on an existing PR are still claimed.
+    max_open_prs: int | None = None
+    authors: tuple[str, ...] = ()
+
+    def at_pr_limit(self, statuses) -> bool:
+        if self.max_open_prs is None:
+            return False
+        mine = set(self.authors) or {self.worker}
+        n = sum(1 for st in statuses if st.core.need in (Need.REVIEW, Need.MERGE) and st.core.author in mine)
+        return n >= self.max_open_prs
 
 
 def _cooling(st: Status, now: float) -> bool:
@@ -69,9 +81,10 @@ def _cooling(st: Status, now: float) -> bool:
 
 
 def eligible(td: TaskDef, st: Status, want: Want, done: set[str], now: float | None = None,
-             closed: set[str] | None = None) -> str | None:
+             closed: set[str] | None = None, new_work: bool = True) -> str | None:
     """The kind of claim `want` could make on this task, or None. `done` satisfies dependencies;
-    `closed` (done or cancelled) can never be claimed."""
+    `closed` (done or cancelled) can never be claimed; without `new_work` (the worker is at its
+    open-PR limit) only reviews and work on an existing PR are."""
     if td.id in (closed if closed is not None else done) or st.core.lease is not None:
         return None
     if want.filters and not any(fnmatch.fnmatchcase(td.id, f) for f in want.filters):
@@ -80,6 +93,8 @@ def eligible(td: TaskDef, st: Status, want: Want, done: set[str], now: float | N
     if kind is None or kind not in want.kinds or kind not in td.kinds:
         return None
     if not claimable(st.core, want.worker):
+        return None
+    if kind == "work" and st.core.pr is None and not new_work:
         return None
     if kind == "review" and not want.allow_self_review and want.gh_user:
         if isinstance(st.core.pr, dict) and st.core.pr.get("gh_user") == want.gh_user:
@@ -153,10 +168,13 @@ class GitCoord(Coord):
         tree = self.tasks()
         snaps = self.lock.snapshot()
         now = time.time()
+        new_work = not want.at_pr_limit(s.status for s in snaps.values())
+        if not new_work:
+            log.debug("%s: at its open-PR limit (%s); no new work", want.worker, want.max_open_prs)
         cands = []
         for tid, td in tree.tasks.items():
             snap = snaps.get(tid) or Snap(tid, None, Status.initial(tid))
-            kind = eligible(td, snap.status, want, tree.done, now, tree.closed)
+            kind = eligible(td, snap.status, want, tree.done, now, tree.closed, new_work)
             if kind:
                 cands.append((rank(kind, snap.status, td), kind, td, snap))
         cands.sort(key=lambda c: c[0])
@@ -261,6 +279,7 @@ class ServerCoord(Coord):
         code, body = self.call("POST", "/worker/task-claim", {
             "worker": want.worker, "gh_user": want.gh_user, "kinds": list(want.kinds),
             "filters": list(want.filters), "allow_self_review": want.allow_self_review,
+            "max_open_prs": want.max_open_prs, "authors": list(want.authors),
             "meta": {**meta, "nonce": nonce}})
         if code == 204:
             return None

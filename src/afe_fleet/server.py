@@ -123,7 +123,8 @@ class Store:
 
     def claim(self, body: dict) -> tuple[int, Any]:
         want = Want(body["worker"], body.get("gh_user"), tuple(body.get("kinds") or ("review", "work")),
-                    tuple(body.get("filters") or ()), bool(body.get("allow_self_review")))
+                    tuple(body.get("filters") or ()), bool(body.get("allow_self_review")),
+                    body.get("max_open_prs"), tuple(body.get("authors") or ()))
         meta = dict(body.get("meta") or {})
         nonce = meta.get("nonce")
         with self.lock:
@@ -137,11 +138,13 @@ class Store:
                             self.db.execute("commit")
                             return 200, self._lease_response(row, st)
                 done, closed = self._closed()
+                rows = self.db.execute("select id, spec, deps, kinds, priority, present, rev, status, "
+                                       "token from tasks where present = 1").fetchall()
+                new_work = not want.at_pr_limit(self._status(row) for row in rows)
                 cands = []
-                for row in self.db.execute("select id, spec, deps, kinds, priority, present, rev, status, "
-                                           "token from tasks where present = 1").fetchall():
+                for row in rows:
                     td, st = self._taskdef(row), self._status(row)
-                    kind = eligible(td, st, want, done, closed=closed)
+                    kind = eligible(td, st, want, done, closed=closed, new_work=new_work)
                     if kind:
                         cands.append((rank(kind, st, td), kind, row, st))
                 if not cands:
