@@ -2,13 +2,17 @@
 
 For every rate-limit window the subscription reports (a 5-hour session, a week, a per-model
 week), `used` is the fraction of the limit spent and `elapsed` the fraction of the window
-passed. A worker with `spare_capacity = L` claims only while
+passed. A worker with `spare_capacity = L` claims only while, in every window,
 
-    max(used / elapsed over all windows) < L
+    used < L * elapsed + ease_in * (1 - elapsed) + allowance
 
-so at L = 1 it never spends faster than the clock refills, and below 1 it leaves headroom for
-whoever else uses the account. A window with nothing used counts as 0; usage it cannot read
-counts as no spare capacity. Running attempts are never interrupted: the check gates claims.
+The pace line `L * elapsed` alone is `used / elapsed < L`: at L = 1 the worker never spends
+faster than the clock refills, and below 1 it leaves headroom for whoever else uses the account.
+It is unforgiving right after a reset, when `elapsed` is near 0, so `ease_in` grants a head
+start that fades linearly to nothing at the window's end, and `allowance` a constant margin
+(both fractions of the limit, default 0). A window with nothing used never blocks; a reported
+hard limit always does; usage it cannot read counts as no spare capacity. Running attempts are
+never interrupted: the check gates claims.
 
 Usage is read through the agent CLI itself, without a model request: Claude Code answers a
 `/usage` message in stream-json mode with a `usage_report` (`rate_limits.limits[]` with `group`,
@@ -47,14 +51,12 @@ class Window:
     used: float  # fraction of the limit spent
     elapsed: float  # fraction of the window passed, 0..1
 
-    @property
-    def ratio(self) -> float:
-        if self.used <= 0:
-            return 0.0
-        return self.used / self.elapsed if self.elapsed > 0 else math.inf
+    def budget(self, limit: float, ease_in: float = 0.0, allowance: float = 0.0) -> float:
+        """The fraction of the limit this window may have used by now."""
+        return limit * self.elapsed + ease_in * (1 - self.elapsed) + allowance
 
-    def describe(self) -> str:
-        return f"{self.name} {self.used:.0%} used at {self.elapsed:.0%} of its window"
+    def spare(self, limit: float, ease_in: float = 0.0, allowance: float = 0.0) -> bool:
+        return self.used <= 0 or self.used < self.budget(limit, ease_in, allowance)
 
 
 def _elapsed(resets_at: float, length: float, now: float) -> float:
@@ -100,7 +102,8 @@ def parse_codex(result: dict, now: float) -> list[Window]:
         raise UsageUnknown("no rateLimits in the Codex usage report")
     rl = result["rateLimits"]
     if result.get("ordinaryUsageAllowed") is False or rl.get("rateLimitReachedType"):
-        return [Window(f"codex limit reached ({rl.get('rateLimitReachedType') or 'usage not allowed'})", 1.0, 0.0)]
+        why = rl.get("rateLimitReachedType") or "usage not allowed"
+        return [Window(f"codex limit reached ({why})", math.inf, 0.0)]  # no allowance passes a hard limit
     out = []
     for key in ("primary", "secondary"):
         w = rl.get(key)
@@ -127,14 +130,20 @@ def parse_codex(result: dict, now: float) -> list[Window]:
 PARSERS = {"claude": parse_claude, "codex": parse_codex}
 
 
-def verdict(windows: list[Window], limit: float) -> tuple[bool, str]:
-    """Whether there is spare capacity, and the window that decides it."""
+def verdict(windows: list[Window], limit: float, ease_in: float = 0.0, allowance: float = 0.0) -> tuple[bool, str]:
+    """Whether there is spare capacity, and the window that decides it: the first one over its
+    budget, else the one closest to it."""
     if not windows:
         return False, "no usage windows"
-    worst = max(windows, key=lambda w: w.ratio)
-    ratio = "∞" if math.isinf(worst.ratio) else f"{worst.ratio:.2f}"
-    rel = "<" if worst.ratio < limit else "≥"
-    return worst.ratio < limit, f"{worst.describe()}: ratio {ratio} {rel} {limit:g}"
+    over = [w for w in windows if not w.spare(limit, ease_in, allowance)]
+    used_any = [w for w in windows if w.used > 0] or windows
+    worst = over[0] if over else min(used_any, key=lambda w: w.budget(limit, ease_in, allowance) - w.used)
+    if math.isinf(worst.used):
+        return False, worst.name
+    budget = worst.budget(limit, ease_in, allowance)
+    rel = "≥" if over else "<"
+    return not over, (f"{worst.name} {worst.used:.0%} used {rel} budget {budget:.0%} "
+                      f"at {worst.elapsed:.0%} of its window")
 
 
 def read_claude(claude: str = "claude", timeout: float = 120) -> dict:
@@ -225,11 +234,12 @@ class SpareCapacity:
     prints the usage JSON instead."""
 
     def __init__(self, cli: str, limit: float, command: list[str] | None = None, *, exe: str | None = None,
-                 ttl: float = 300, clock: Callable[[], float] = time.time,
-                 reader: Callable[[], dict] | None = None):
+                 ease_in: float = 0.0, allowance: float = 0.0, ttl: float = 300,
+                 clock: Callable[[], float] = time.time, reader: Callable[[], dict] | None = None):
         if cli not in PARSERS:
             raise ValueError(f"no usage parser for agent CLI {cli!r}")
         self.cli, self.limit, self.ttl, self.clock = cli, limit, ttl, clock
+        self.ease_in, self.allowance = ease_in, allowance
         if reader is not None:
             self.read = reader
         elif command:
@@ -252,4 +262,4 @@ class SpareCapacity:
                     self._windows, self._error = None, str(e)
             if self._windows is None:
                 return False, f"usage unknown ({self._error})"
-            return verdict(self._windows, self.limit)
+            return verdict(self._windows, self.limit, self.ease_in, self.allowance)

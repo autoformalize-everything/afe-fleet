@@ -88,7 +88,8 @@ def cmd_worker(args) -> int:
         return HostConfig.load(loaded.fleet.name, Path(args.host_config) if args.host_config else None,
                                worker_id=args.id, gh_user=user, slots=args.slots,
                                kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter,
-                               model=args.model, effort=args.effort, spare_capacity=args.spare_capacity)
+                               model=args.model, effort=args.effort, spare_capacity=args.spare_capacity,
+                               spare_ease_in=args.spare_ease_in, spare_allowance=args.spare_allowance)
 
     host = host_config(gh_user)
     if host.gh_user is None:
@@ -121,9 +122,10 @@ def cmd_worker(args) -> int:
     capacity = None
     if host.spare_capacity is not None:
         capacity = SpareCapacity(host.agent.cli, host.spare_capacity, host.agent.usage_command or None,
-                                 exe=os.path.expanduser(host.agent.command[0]))
-        log.info("claiming only with spare %s capacity: max(used / elapsed) < %g", host.agent.cli,
-                 host.spare_capacity)
+                                 exe=os.path.expanduser(host.agent.command[0]), ease_in=host.spare_ease_in,
+                                 allowance=host.spare_allowance)
+        log.info("claiming only with spare %s capacity: used < %g × elapsed + %g × (1 − elapsed) + %g in every "
+                 "window", host.agent.cli, host.spare_capacity, host.spare_ease_in, host.spare_allowance)
 
     def make(slot: int) -> Worker:
         coord, cfg = _coord(loaded, host.worker_id, slot)
@@ -255,8 +257,13 @@ def parser() -> argparse.ArgumentParser:
     wr.add_argument("--model", help="override the model for every task (e.g. fable-5.2, opus-5.5, sonnet-5.5)")
     wr.add_argument("--effort", help="override the effort level: low, medium, high, xhigh, max")
     wr.add_argument("--spare-capacity", type=float, metavar="LIMIT",
-                    help="claim only while max(used / elapsed) over the agent subscription's rate-limit "
-                         "windows is below LIMIT (1 = no faster than the windows refill)")
+                    help="claim only while, in every rate-limit window of the agent's subscription, used < "
+                         "LIMIT × elapsed + EASE_IN × (1 − elapsed) + ALLOWANCE (LIMIT 1: no faster than "
+                         "the windows refill)")
+    wr.add_argument("--spare-ease-in", type=float, metavar="EASE_IN",
+                    help="head start right after a window resets, fading to 0 at its end (fraction of the limit)")
+    wr.add_argument("--spare-allowance", type=float, metavar="ALLOWANCE",
+                    help="constant margin over the pace line (fraction of the limit)")
     wr.add_argument("--once", action="store_true", help="one claim and attempt, then exit")
 
     a = sub.add_parser("admin", help="run the admin").add_subparsers(dest="action", required=True)

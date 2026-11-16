@@ -157,8 +157,11 @@ class HostConfig:
     allow_self_review: bool = False
     push: str = "origin"  # "origin" | "fork": where work branches are pushed
     git_protocol: str = "ssh"
-    # claim only while max(used / elapsed) over the subscription's windows is below this (capacity.py)
+    # claim only while, in every subscription window,
+    # used < spare_capacity * elapsed + spare_ease_in * (1 - elapsed) + spare_allowance (capacity.py)
     spare_capacity: float | None = None
+    spare_ease_in: float = 0.0
+    spare_allowance: float = 0.0
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     @staticmethod
@@ -194,7 +197,11 @@ class HostConfig:
             allow_self_review=bool(w.get("allow_self_review", False)), push=w.get("push", "origin"),
             git_protocol=w.get("git_protocol", "ssh"), agent=agent,
             spare_capacity=_positive(overrides.get("spare_capacity") or w.get("spare_capacity"),
-                                     f"{path}: [worker] spare_capacity"))
+                                     f"{path}: [worker] spare_capacity"),
+            spare_ease_in=_fraction(_first(overrides.get("spare_ease_in"), w.get("spare_ease_in")),
+                                    f"{path}: [worker] spare_ease_in"),
+            spare_allowance=_fraction(_first(overrides.get("spare_allowance"), w.get("spare_allowance")),
+                                      f"{path}: [worker] spare_allowance"))
         if agent.runtime not in ("container", "docker", "local"):
             raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
         if agent.cli == "codex" and agent.runtime == "docker":
@@ -207,6 +214,19 @@ def _positive(v: object, what: str) -> float | None:
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
         raise ValueError(f"{what} must be a positive number, not {v!r}")
+    return float(v)
+
+
+def _first(*vs: object) -> object:
+    return next((v for v in vs if v is not None), None)
+
+
+def _fraction(v: object, what: str) -> float:
+    """A non-negative fraction of a limit; absent is 0."""
+    if v is None:
+        return 0.0
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= 0:
+        raise ValueError(f"{what} must be a number ≥ 0, not {v!r}")
     return float(v)
 
 

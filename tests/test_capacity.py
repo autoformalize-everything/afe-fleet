@@ -51,28 +51,56 @@ def test_codex_windows():
     ws = {w.name: w for w in parse_codex(codex_report(), NOW)}
     assert set(ws) == {"5h", "7d"}
     assert ws["5h"].used == pytest.approx(0.02) and ws["5h"].elapsed == pytest.approx(0.2)
-    assert ws["7d"].ratio == 0  # nothing used
+    assert ws["7d"].used == 0 and ws["7d"].spare(0.0)  # nothing used never blocks
     assert [w.name for w in parse_codex(codex_report(secondary=None), NOW)] == ["5h"]  # a plan with one window
 
 
-def test_the_rule_is_max_used_over_elapsed_below_the_limit():
-    # session 13% at 60% (0.22), weekly 16% at ~82% (0.19), scoped 5% (0.06): spare at 1 and at 0.5
+def test_the_pace_rule_is_used_over_elapsed_below_the_limit():
+    # with no ease-in or allowance the budget is limit × elapsed, i.e. used / elapsed < limit:
+    # session 13% at 60% (0.22), weekly 16% at ~82% (0.19), scoped 5% (0.06)
     assert verdict(parse_claude(claude_report(), NOW), 1.0)[0]
     ok, why = verdict(parse_claude(claude_report(), NOW), 0.2)
-    assert not ok and why.startswith("session 13% used at 60% of its window: ratio 0.22 ≥ 0.2")
+    assert not ok and why == "session 13% used ≥ budget 12% at 60% of its window"
+    assert verdict(parse_claude(claude_report(), NOW), 0.25) == (True, "session 13% used < budget 15% at 60% of its window")
     # spending faster than the clock in any one window blocks
     assert not verdict(parse_claude(claude_report(session=(70, NOW + 2 * H)), NOW), 1.0)[0]
     assert not verdict(parse_codex(codex_report(secondary=(50, 10080, NOW + 6 * D)), NOW), 1.0)[0]
 
 
+def test_ease_in_gives_a_head_start_that_fades():
+    fresh = Window("session", used=0.03, elapsed=0.01)  # 3% spent three minutes after a reset
+    assert not fresh.spare(1.0)  # the bare pace line: 1% budget
+    assert fresh.budget(1.0, ease_in=0.1) == pytest.approx(0.01 + 0.099)
+    assert fresh.spare(1.0, ease_in=0.1)
+    late = Window("session", used=0.97, elapsed=0.95)  # the head start is nearly gone at the end
+    assert late.budget(1.0, ease_in=0.1) == pytest.approx(0.955)
+    assert not late.spare(1.0, ease_in=0.1)
+    assert late.spare(1.0, ease_in=0.1, allowance=0.02)  # the allowance is constant
+    assert Window("w", 0.5, 1.0).budget(0.8, ease_in=0.3, allowance=0.05) == pytest.approx(0.85)
+
+
 def test_edges():
-    assert Window("w", 0.0, 0.0).ratio == 0  # nothing used: never blocks
-    assert math.isinf(Window("w", 0.01, 0.0).ratio)  # used in a window that has not started
+    assert Window("w", 0.0, 0.0).spare(0.0)  # nothing used: never blocks
+    assert not Window("w", 0.01, 0.0).spare(1.0)  # used in a window that has barely started
     # an idle Claude window (no reset clock, 0%) counts as unused
     assert verdict(parse_claude(claude_report(session=(0, None)), NOW), 1.0)[0]
-    # Codex says no
-    assert not verdict(parse_codex(codex_report(allowed=False), NOW), 10.0)[0]
-    assert not verdict(parse_codex(codex_report(reached="primary"), NOW), 10.0)[0]
+    # Codex says no: no allowance gets past a hard limit
+    assert verdict(parse_codex(codex_report(allowed=False), NOW), 10.0, 5.0, 5.0) == \
+        (False, "codex limit reached (usage not allowed)")
+    assert not verdict(parse_codex(codex_report(reached="primary"), NOW), 10.0, 5.0, 5.0)[0]
+    assert verdict([], 1.0) == (False, "no usage windows")
+
+
+def test_spare_capacity_settings(tmp_path):
+    from afe_fleet.config import HostConfig
+    p = tmp_path / "h.toml"
+    p.write_text("[worker]\nspare_capacity = 0.9\nspare_ease_in = 0.1\n")
+    h = HostConfig.load("f", p)
+    assert (h.spare_capacity, h.spare_ease_in, h.spare_allowance) == (0.9, 0.1, 0.0)
+    assert HostConfig.load("f", p, spare_allowance=0.05, spare_ease_in=0.0).spare_ease_in == 0.0
+    p.write_text("[worker]\nspare_capacity = 1\nspare_allowance = -0.1\n")
+    with pytest.raises(ValueError, match="spare_allowance"):
+        HostConfig.load("f", p)
 
 
 @pytest.mark.parametrize("report", [

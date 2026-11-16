@@ -121,6 +121,7 @@ kinds = ["review", "work"]
 filters = ["zlib/*"]
 push = "fork"              # push work branches to your fork ("origin" if you can push upstream)
 # spare_capacity = 1.0     # claim only with spare subscription capacity (below)
+# spare_ease_in = 0.1      # ... with a head start after each window resets
 
 [agent]
 # Runs directly on this machine, as you, in a git worktree; it uses your normal Claude login.
@@ -136,17 +137,23 @@ repairs = 2
 ### Spare capacity
 
 `spare_capacity = L` in `[worker]` (or `worker run --spare-capacity L`) makes the worker claim
-only while the agent's subscription is used more slowly than its rate-limit windows refill:
+only while the agent's subscription is used no faster than its rate-limit windows refill. In
+every window the subscription reports (Claude: the 5-hour session, the week, and per-model weeks;
+Codex: its 5-hour and weekly windows):
 
-    max(used / elapsed for every window) < L
+    used < L × elapsed + ease_in × (1 − elapsed) + allowance
 
-`used` is the fraction of a window's limit spent and `elapsed` the fraction of the window
-passed, for every window the subscription reports (Claude: the 5-hour session, the week, and
-per-model weeks; Codex: its 5-hour and weekly windows). At `L = 1` the worker never spends
-faster than the clock; below 1 it leaves room for whoever else uses the account. A window with
-nothing used never blocks. Usage that cannot be read counts as no spare capacity. Running
-attempts are not interrupted; the check gates claims only, and readings are cached for five
-minutes across slots.
+`used` is the fraction of the window's limit spent and `elapsed` the fraction of the window
+passed. The pace line `L × elapsed` alone is `used / elapsed < L`: at `L = 1` the worker never
+spends faster than the clock, and below 1 it leaves room for whoever else uses the account. Right
+after a reset it allows almost nothing, so `spare_ease_in` (`--spare-ease-in`) grants a head
+start that fades linearly to zero by the window's end, and `spare_allowance`
+(`--spare-allowance`) a constant margin; both are fractions of the limit and default to 0. For
+example `L = 1, ease_in = 0.1` allows 10% at a reset, 55% halfway, 100% at the end.
+
+A window with nothing used never blocks, and a hard limit the provider reports always does.
+Usage that cannot be read counts as no spare capacity. Running attempts are not interrupted;
+the check gates claims only, and readings are cached for five minutes across slots.
 
 Usage is read through the agent CLI, without a model request: a `/usage` message to `claude` in
 stream-json mode, or `account/rateLimits/read` to `codex app-server`. `[agent] usage_command`
