@@ -82,15 +82,16 @@ def cmd_worker(args) -> int:
     loaded = load(args.source)
     forge = _forge(args)
     gh_user = args.gh_user
-    host = HostConfig.load(loaded.fleet.name, Path(args.host_config) if args.host_config else None,
-                           worker_id=args.id, gh_user=gh_user, slots=args.slots,
-                           kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter)
+    def host_config(user):
+        return HostConfig.load(loaded.fleet.name, Path(args.host_config) if args.host_config else None,
+                               worker_id=args.id, gh_user=user, slots=args.slots,
+                               kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter,
+                               model=args.model, effort=args.effort)
+
+    host = host_config(gh_user)
     if host.gh_user is None:
-        host = replace(host, gh_user=forge.login())
-        if args.id is None and host.gh_user:
-            host = HostConfig.load(loaded.fleet.name, Path(args.host_config) if args.host_config else None,
-                                   worker_id=None, gh_user=host.gh_user, slots=args.slots,
-                                   kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter)
+        login = forge.login()
+        host = host_config(login) if args.id is None and login else replace(host, gh_user=login)
     log.info("afe-fleet %s worker %s for fleet %s (%s mode, %d slot%s)", __version__, host.worker_id,
              loaded.fleet.name, loaded.fleet.mode, host.slots, "" if host.slots == 1 else "s")
     update_lock = threading.Lock()
@@ -241,6 +242,8 @@ def parser() -> argparse.ArgumentParser:
     wr.add_argument("--kinds", help="comma-separated: work,review")
     wr.add_argument("--filter", action="append", help="glob on task ids; repeatable")
     wr.add_argument("--host-config", help="per-host config (default ~/.config/afe-fleet/<fleet>.toml)")
+    wr.add_argument("--model", help="override the model for every task (e.g. fable-5.2, opus-5.5, sonnet-5.5)")
+    wr.add_argument("--effort", help="override the effort level: low, medium, high, xhigh, max")
     wr.add_argument("--once", action="store_true", help="one claim and attempt, then exit")
 
     a = sub.add_parser("admin", help="run the admin").add_subparsers(dest="action", required=True)

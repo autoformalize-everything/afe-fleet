@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .agentchoice import AgentChoice, cli_args
 from .config import AgentConfig
 
 log = logging.getLogger(__name__)
@@ -93,14 +94,16 @@ class Runtime:
             return {"task_dir": str(ws.task), "out_dir": str(ws.out)}
         return {"task_dir": "/task", "out_dir": "/out"}
 
-    def agent_argv(self, ws: Workspace) -> tuple[list[str], dict[str, str], Path]:
+    def agent_argv(self, ws: Workspace, extra: list[str] | None = None) -> tuple[list[str], dict[str, str], Path]:
+        """The agent command line; `extra` (model, effort flags) goes after the configured command."""
+        extra = extra or []
         if self.cfg.runtime == "local":
             # Runs as you, with your HOME: the agent CLI uses your normal login and settings.
             env = {**os.environ, **self.cfg.env, "AFE_WORK": str(ws.work), "AFE_TASK": str(ws.task),
                    "AFE_OUT": str(ws.out)}
             if self.cfg.isolate_home:
                 env["HOME"] = str(ws.home)
-            return [os.path.expanduser(a) for a in self.cfg.command], env, ws.work
+            return [os.path.expanduser(a) for a in self.cfg.command] + extra, env, ws.work
         if not self.image:
             raise ValueError("project.toml has no image; docker runtime needs one")
         argv = ["docker", "run", "--rm", "-i", "--name", self.name, "--label", f"afe-fleet={self.label}",
@@ -112,7 +115,7 @@ class Runtime:
             argv += ["-v", os.path.expanduser(m)]
         for k, v in self.cfg.env.items():
             argv += ["-e", f"{k}={v}"]
-        argv += [*self.cfg.docker_args, self.image, *self.cfg.command]
+        argv += [*self.cfg.docker_args, self.image, *self.cfg.command, *extra]
         return argv, dict(os.environ), ws.root
 
     def verify_argv(self, ws: Workspace, cmd: list[str]) -> tuple[list[str], Path]:
@@ -169,10 +172,11 @@ def user_message(text: str) -> str:
 
 
 def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], Verify],
-              cancel: threading.Event, repairs: int | None = None) -> AgentRun:
+              cancel: threading.Event, repairs: int | None = None,
+              choice: AgentChoice | None = None) -> AgentRun:
     cfg = rt.cfg
     repairs = cfg.repairs if repairs is None else repairs
-    argv, env, cwd = rt.agent_argv(ws)
+    argv, env, cwd = rt.agent_argv(ws, cli_args(choice or AgentChoice(), cfg.model_args, cfg.effort_args))
     rt.remove_strays()
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

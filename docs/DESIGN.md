@@ -277,6 +277,8 @@ Work branch name `task/<task-id>/e<epoch>`; PR found by head branch before creat
 
 - Agent contract: read `TASK.md` and `task.json` from the task directory named in the prompt; work in the worktree (the current directory); commit; write `result.json` in the output directory named in the prompt (`outcome`, `summary`, `progress`, `debug`, `followups[]`) or `/out/review.json` (`verdict`, `summary`, `comments[]`).
 
+**Model and effort.** Each attempt runs with a model and effort level resolved, field by field, from the worker's `--model`/`--effort` flags, then `task.toml`, then `project.toml`, then the host config, then the built-in defaults (Opus 5.5 for work, Sonnet 5.5 for review), each as an `[agent]` table with optional `[agent.work]`/`[agent.review]` sub-tables. Short names (`fable-5.2`, `opus-5.5`, `sonnet-5.5`, `haiku-5.5`) map to model IDs; effort is `low` to `max`. An invalid value in the task tree makes the task unclaimable instead of failing attempts. The choice is recorded in `last.agent` and on the PR.
+
 **Agent supervisor.** The worker owns the JSONL pipe.
 
 - Send the prompt on stdin as a `user` message. Never pass it in argv (Linux rejects a single argument over 128 KiB).

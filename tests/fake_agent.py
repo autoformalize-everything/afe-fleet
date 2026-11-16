@@ -31,6 +31,9 @@ def commit(msg):
     subprocess.run(["git", "commit", "-q", "-m", msg], cwd=work, check=True)
 
 
+if os.environ.get("FAKE_AGENT_ARGV_LOG"):  # lets tests see the flags the worker passed
+    with open(os.environ["FAKE_AGENT_ARGV_LOG"], "a") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\n")
 emit({"type": "system", "subtype": "init", "session_id": f"fake-{os.getpid()}"})
 turn = 0
 for line in sys.stdin:

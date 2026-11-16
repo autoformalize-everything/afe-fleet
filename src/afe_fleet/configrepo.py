@@ -21,6 +21,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import agentchoice
 from .gitutil import Git, GitError
 
 log = logging.getLogger(__name__)
@@ -121,6 +122,12 @@ class ConfigRepo:
                 meta = tomllib.loads(meta_raw.decode()) if meta_raw else {}
             except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
                 log.warning("task %s: bad toml: %s", tid, e)
+                continue
+            try:
+                agentchoice.validate(meta.get("agent"), f"{d}/task.toml")
+                agentchoice.validate(project.get("agent"), proj_path)
+            except ValueError as e:
+                log.warning("task %s skipped: %s", tid, e)
                 continue
             dir_hash = self.git("rev-parse", f"{rev}:{d}")
             spec = hashlib.sha256(f"{dir_hash}\n{blobs[proj_path]}\n".encode()).hexdigest()[:16]

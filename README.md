@@ -80,7 +80,8 @@ The config repo:
 fleet.toml
 tasks/<project>/project.toml      repo, base, image, verify (nearest one above a task applies)
 tasks/<task-id>/TASK.md           the task; a task is a directory with TASK.md and none below it
-tasks/<task-id>/task.toml         optional: deps = [...], kinds = ["work", "review"], priority
+tasks/<task-id>/task.toml         optional: deps = [...], kinds = ["work", "review"], priority,
+                                  verify = [...], [agent] model/effort
 done/<task-id>.json               written by the admin
 cancelled/<task-id>.json          written by the admin
 ```
@@ -127,7 +128,38 @@ command = ["claude", "-p", "--input-format", "stream-json", "--output-format", "
 max_wall = "4h"
 stall = "20m"
 repairs = 2
+# model = "opus-5.5"       # host default when the task and project say nothing
+# effort = "high"
 ```
+
+### Models and effort
+
+`model` and `effort` can be set in `task.toml`, `project.toml` and the host config, each in an
+`[agent]` table with optional `[agent.work]` / `[agent.review]` sub-tables, for example:
+
+```toml
+# tasks/bzip2/project.toml
+[agent]
+effort = "high"
+
+[agent.work]
+model = "fable-5.2"        # this project's work needs the strongest model
+```
+
+**Defaults** when nothing sets a model: Opus 5.5 (`claude-opus-5-5`) for work, Sonnet 5.5
+(`claude-sonnet-5-5`) for review. Effort defaults to the agent CLI's own.
+
+- **Models:** `fable-5.2`, `fable-5.1`, `opus-5.5`, `opus-5`, `sonnet-5.5`, `sonnet-5`, `haiku-5.5`;
+  the family names `fable`, `opus`,
+  `sonnet`, `haiku` (the agent CLI picks the latest); or a full `claude-…` model ID.
+- **Effort:** `low`, `medium`, `high`, `xhigh`, `max`.
+- **Precedence**, field by field: `worker run --model/--effort`, then `task.toml`, then
+  `project.toml`, then the host config, then the defaults above; within each,
+  `[agent.<kind>]` before `[agent]`.
+- A task whose `task.toml` or `project.toml` names an unknown model or effort is not claimable;
+  the worker logs why.
+- The choice is passed as `--model` / `--effort` (host config `model_args` / `effort_args` change
+  that for other agent CLIs) and recorded in the task's status, the PR body and the review.
 
 ## Test
 

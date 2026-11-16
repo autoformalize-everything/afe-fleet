@@ -18,6 +18,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import agentchoice
 from .configrepo import ConfigRepo
 from .gitutil import repo_url
 
@@ -124,6 +125,11 @@ class AgentConfig:
     max_wall: float = 4 * 3600
     stall: float = 20 * 60
     repairs: int = 2
+    # model and effort (see agentchoice.py): the host's [agent] table and CLI overrides
+    choice_table: dict = field(default_factory=dict)  # host default, lowest precedence
+    choice_cli: dict = field(default_factory=dict)  # --model / --effort, highest precedence
+    model_args: list[str] = field(default_factory=lambda: ["--model", "{model}"])
+    effort_args: list[str] = field(default_factory=lambda: ["--effort", "{effort}"])
 
 
 @dataclass
@@ -146,9 +152,15 @@ class HostConfig:
         gh_user = overrides.get("gh_user") or w.get("gh_user")
         default_id = f"{gh_user or getpass.getuser()}/{socket.gethostname()}"
         agent = AgentConfig()
-        for k in ("runtime", "command", "mounts", "env", "docker_args", "repairs", "isolate_home"):
+        for k in ("runtime", "command", "mounts", "env", "docker_args", "repairs", "isolate_home",
+                  "model_args", "effort_args"):
             if k in a:
                 setattr(agent, k, a[k])
+        agentchoice.validate(a, str(path))
+        agent.choice_table = {k: a[k] for k in ("model", "effort", *agentchoice.KINDS) if k in a}
+        cli = {k: overrides[k] for k in ("model", "effort") if overrides.get(k)}
+        agentchoice.validate(cli, "command line")
+        agent.choice_cli = cli
         for k in ("max_wall", "stall"):
             if k in a:
                 setattr(agent, k, parse_duration(a[k]))

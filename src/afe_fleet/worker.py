@@ -22,7 +22,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import agentchoice
 from .agent import Runtime, Verify, Workspace, run_agent, run_verify
+from .agentchoice import AgentChoice
 from .config import HostConfig, Loaded, fleet_home
 from .configrepo import TaskDef
 from .coord import Coord, Fenced, GitCoord, Lease, ServerCoord, Unreachable, Want
@@ -252,6 +254,11 @@ class Worker:
                     log.info("heartbeat on %s: coordination reachable again", lease.task)
                     lease.extra.pop("unreachable_since", None)
 
+    def _choice(self, td: TaskDef, kind: str) -> AgentChoice:
+        a = self.host.agent
+        return agentchoice.choose(kind, a.choice_cli, td.meta.get("agent"), td.project.get("agent"), a.choice_table,
+                                  agentchoice.DEFAULTS)
+
     def _runtime(self, td: TaskDef) -> Runtime:
         return Runtime(self.host.agent, td.project.get("image"), f"afe-fleet-{self.fleet.name}-{self.slot}",
                        self.fleet.name)
@@ -294,7 +301,9 @@ class Worker:
         rt = self._runtime(td)
         verify_cmd = td.meta.get("verify", proj.get("verify"))  # task.toml overrides project.toml
         prompt = WORK_PROMPT.format(task=lease.task, extra=proj.get("prompt", ""), **rt.paths(ws))
-        run = run_agent(rt, ws, prompt, cancel=cancel,
+        choice = self._choice(td, "work")
+        log.info("%s: running the agent (%s)", lease.task, choice.describe())
+        run = run_agent(rt, ws, prompt, cancel=cancel, choice=choice,
                         verify=lambda: run_verify(rt, ws, verify_cmd, self.host.agent.max_wall))
         if lease.extra.get("fenced"):
             raise Fenced(f"{lease.task}: lease lost during the attempt")
@@ -315,7 +324,7 @@ class Worker:
         claimed = (result or {}).get("outcome", "success")
         summary = (result or {}).get("summary", "")
         last = {"worker": self.worker_id, "summary": summary, "progress": (result or {}).get("progress"),
-                "agent": {"reason": run.reason, "exit": run.exit_code, "turns": run.turns,
+                "agent": {**choice.to_json(), "reason": run.reason, "exit": run.exit_code, "turns": run.turns,
                           "session": run.session_id}}
         if not changed:
             self.infra_failures = self.infra_failures + 1 if infra else 0
@@ -355,7 +364,7 @@ class Worker:
         self.journal.write(step="pushed", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease), sha=head)
         title = f"{lease.task}: {summary.splitlines()[0][:60]}" if summary else f"afe-fleet: {lease.task}"
-        body = (f"Task `{lease.task}`, attempt {lease.epoch} by `{self.worker_id}`.\n\n{summary}\n\n"
+        body = (f"Task `{lease.task}`, attempt {lease.epoch} by `{self.worker_id}` ({choice.describe()}).\n\n{summary}\n\n"
                 f"Verify: {'passed' if verify.ok else 'failed'}\n\n<!-- afe-fleet task={lease.task} epoch={lease.epoch} -->")
         try:
             pr = self.forge.ensure_pr(repo=proj["repo"], branch=branch, head_owner=owner, base=base,
@@ -366,7 +375,7 @@ class Worker:
               "fetch": pr.get("fetch") or push_url}
         try:
             if reuse:
-                self.forge.comment(pr, f"Attempt {lease.epoch} by `{self.worker_id}` pushed "
+                self.forge.comment(pr, f"Attempt {lease.epoch} by `{self.worker_id}` ({choice.describe()}) pushed "
                                        f"`{head[:12]}`.\n\n{summary}\n\nVerify: {'passed' if verify.ok else 'failed'}")
             elif isinstance(prev, dict) and prev.get("number") and prev.get("repo") == proj["repo"] \
                     and prev.get("number") != pr.get("number") and self._pr_open(prev):
@@ -405,7 +414,9 @@ class Worker:
         rt = self._runtime(td)
         prompt = REVIEW_PROMPT.format(task=lease.task, sha=sha, base=proj.get("base", "main"),
                                       extra=proj.get("review_prompt", ""), **rt.paths(ws))
-        run = run_agent(rt, ws, prompt, cancel=cancel, repairs=0, verify=lambda: Verify(True, ""))
+        choice = self._choice(td, "review")
+        log.info("%s: reviewing (%s)", lease.task, choice.describe())
+        run = run_agent(rt, ws, prompt, cancel=cancel, repairs=0, verify=lambda: Verify(True, ""), choice=choice)
         if lease.extra.get("fenced"):
             raise Fenced(f"{lease.task}: lease lost during review")
         review = {} if lease.extra.get("shutdown") else (self._read_json(ws.out / "review.json") or {})
@@ -415,9 +426,9 @@ class Worker:
         if verdict is not Verdict.ABSTAIN:
             body = summary + "".join(f"\n\n`{c.get('path')}:{c.get('line')}`: {c.get('body')}"
                                      for c in review.get("comments", []) if isinstance(c, dict))
-            self.forge.post_review(pr, sha, verdict.value, body)
+            self.forge.post_review(pr, sha, verdict.value, f"{body}\n\n_Reviewed by `{self.worker_id}` ({choice.describe()})._")
         self.coord.review(lease, verdict, {"outcome": verdict.value, "worker": self.worker_id,
-                                           "summary": summary, "reviewed_sha": sha,
+                                           "summary": summary, "reviewed_sha": sha, "agent": choice.to_json(),
                                            "comments": review.get("comments", [])})
         log.info("%s: review %s at %s", lease.task, verdict.value, sha[:8])
 
