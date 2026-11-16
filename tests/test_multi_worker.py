@@ -50,3 +50,17 @@ def test_a_legacy_journal_is_adopted(world, tmp_path):
     w = Worker(world.loaded(), world.host("alice"), NoCoord(), None, state_dir=state)
     assert w.journal.read() == {"step": "claimed", "task": "demo/a", "epoch": 1}
     assert not (state / "journal-0.json").exists()
+
+
+def test_concurrent_fetches_into_one_mirror(world, tmp_path):
+    """Several processes load the same fleet.toml mirror at once (they all start together)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from afe_fleet.configrepo import ConfigRepo
+    from conftest import edit_repo
+    url = str(world.config_repo)
+    store = tmp_path / "mirror.git"
+    edit_repo(world.config_repo, {"tasks/demo/NOTE.md": "moved\n"})  # a new tip: every fetch updates the ref
+    with ThreadPoolExecutor(8) as pool:
+        revs = list(pool.map(lambda _: ConfigRepo(url, store).fetch(), range(16)))
+    assert len(set(revs)) == 1 and revs[0]

@@ -14,6 +14,7 @@ worker's post-claim done check relies on it being linearizable (docs/DESIGN.md s
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -63,7 +64,11 @@ class Tree:
 class ConfigRepo:
     def __init__(self, url: str, store: Path, *, branch: str | None = None, who: str = "afe-fleet"):
         self.url = url
-        self.git = Git(store, name=who).init_bare()
+        self.lockfile = store.with_name(store.name + ".lock")
+        store.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.lockfile, "a") as lock:  # creating it races too, on a fresh host
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.git = Git(store, name=who).init_bare()
         self._branch = branch
 
     @property
@@ -79,13 +84,19 @@ class ConfigRepo:
         return self._branch
 
     def fetch(self) -> str | None:
-        """Fetch the branch tip; returns its commit, or None if the branch does not exist."""
-        p = self.git.run("fetch", "-q", "--no-tags", self.url, f"+refs/heads/{self.branch}:refs/cfg/head")
-        if p.returncode != 0:
-            if "couldn't find remote ref" in p.stderr:
-                return None
-            raise GitError(["fetch", self.url], p.returncode, p.stderr)
-        return self.git("rev-parse", "refs/cfg/head")
+        """Fetch the branch tip; returns its commit, or None if the branch does not exist.
+        Serialized on a lock file beside the store: a mirror may be shared by every afe-fleet
+        process on the host (the fleet.toml mirror is), and concurrent fetches into one
+        repository fail on the ref update."""
+        ref = f"+refs/heads/{self.branch}:refs/cfg/head"
+        with open(self.lockfile, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            p = self.git.run("fetch", "-q", "--no-tags", self.url, ref)
+            if p.returncode != 0:
+                if "couldn't find remote ref" in p.stderr:
+                    return None
+                raise GitError(["fetch", self.url], p.returncode, p.stderr)
+            return self.git("rev-parse", "refs/cfg/head")
 
     def read_file(self, rev: str, path: str) -> bytes | None:
         p = self.git.run("cat-file", "blob", f"{rev}:{path}", input=b"")
