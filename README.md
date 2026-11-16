@@ -90,8 +90,8 @@ tasks/<project>/project.toml      repo, base, image, verify, prepare, paths (nea
 tasks/<task-id>/TASK.md           the task; a task is a directory with TASK.md and none below it
 tasks/<task-id>/task.toml         optional: deps = [...], kinds = ["work", "review"], priority,
                                   verify = [...], paths = [...], [agent] model/effort
-done/<task-id>.json               written by the admin
-cancelled/<task-id>.json          written by the admin
+tasks/<task-id>/done.json         written by the admin when the task is accepted
+tasks/<task-id>/cancelled.json    written by the admin when the task is cancelled
 ```
 
 `fleet.toml`:

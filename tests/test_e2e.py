@@ -76,11 +76,11 @@ def test_github_mode_full_lifecycle(world):
     assert status(world, "demo/a").core.need is Need.DONE
     acts = admin.sweep()
     assert "demo/a: deleted branch task/demo/a/e1 of merged PR #1" in acts
-    assert any("wrote done/demo/a.json" in a for a in acts)
+    assert any("wrote tasks/demo/a/done.json" in a for a in acts)
     assert git("for-each-ref", "--format=%(refname)", "refs/heads/task/", cwd=world.code_repo) == ""
     assert any("deleted lock branch" in a for a in admin.sweep())  # grace is 0 in the test fleet
     assert lock_branches(world) == []
-    assert git("cat-file", "-e", "main:done/demo/a.json", cwd=world.config_repo) == ""
+    assert git("cat-file", "-e", "main:tasks/demo/a/done.json", cwd=world.config_repo) == ""
     assert '"archive": "demo/a"' in git("log", "--format=%B", "archive", cwd=world.lock_repo)
     # the archived history is the whole task: claim, report, claim, review, accept
     tip = git("log", "-1", "--format=%P", "archive", cwd=world.lock_repo).split()[-1]
@@ -196,7 +196,7 @@ def test_admin_cancel_and_task_removal(world):
     acts = admin.cancel("demo/b", reason="not needed")
     assert acts[0] == "demo/b: cancelled"
     assert status(world, "demo/b").core.need is Need.CANCELLED
-    assert git("cat-file", "-e", "main:cancelled/demo/b.json", cwd=world.config_repo) == ""
+    assert git("cat-file", "-e", "main:tasks/demo/b/cancelled.json", cwd=world.config_repo) == ""
     assert any("deleted lock branch" in a for a in admin.sweep())
     assert w.run_once() and status(world, "demo/a").core.need is Need.REVIEW
     assert not w.run_once()  # demo/b is cancelled

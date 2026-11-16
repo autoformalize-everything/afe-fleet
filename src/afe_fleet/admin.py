@@ -9,7 +9,7 @@ GitHub mode (docs/DESIGN.md section 6):
   * lease or PR written against an older task definition → expire / rework
   * need = merge → merge when the PR head is the reviewed SHA and CI is green, then accept;
     red CI, conflict, moved head or closed PR → rework
-  * need = done / cancelled → write done/ or cancelled/<task>.json, archive, delete the lock
+  * need = done / cancelled → write tasks/<task>/done.json or cancelled.json, archive, delete the lock
     branch after the grace period
   * lock branch for a task removed from the tree → cancel (fences the holder), archive, delete
   * lock branch for a task with a done/cancelled record but an open status → delete (a claim
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from .access import AccessRequests
 from .config import Loaded
-from .configrepo import ConfigRepo, Tree
+from .configrepo import ConfigRepo, Tree, record_path
 from .coord import AdminCoord, AdminView, GitAdmin, ServerAdmin
 from .events import NOWHERE
 from .forge import Forge, ForgeError
@@ -298,8 +298,8 @@ class Admin:
             self.config.write_done(task, {"task": task, "status": v.status.to_json(), "lock_tip": v.rev,
                                           "at": self.wall()}, cancelled=cancelled)
             lock.archive(task, v.rev)
-            return branch_acts + [f"{task}: {d}; wrote {d}/{task}.json and archived"]
-        raw = self.config.read_file(tree.rev, f"{d}/{task}.json")
+            return branch_acts + [f"{task}: {d}; wrote {record_path(task, d)} and archived"]
+        raw = self.config.read_record(tree.rev, task, d)
         try:
             at = float(json.loads(raw)["at"])
         except (TypeError, ValueError, KeyError, json.JSONDecodeError):

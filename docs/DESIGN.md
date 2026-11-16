@@ -152,7 +152,7 @@ Event to operation:
 | `accept` | push commit | `POST /admin/task-accepted` `{task, pr, merged_sha}` |
 | `rework` | push commit | `POST /admin/task-rework` `{task, reason, detail}` (not in your list) |
 | `expire` | push commit | `POST /admin/task-expire` `{task, epoch}` (not in your list) |
-| `cancel` | push commit, then a `cancelled/<task-id>.json` record and branch deletion | `POST /admin/task-cancelled` `{task}`; removing a task from the tree also cancels it |
+| `cancel` | push commit, then a `tasks/<task-id>/cancelled.json` record and branch deletion | `POST /admin/task-cancelled` `{task}`; removing a task from the tree also cancels it |
 
 ### GitHub specifics
 
@@ -165,17 +165,17 @@ Event to operation:
   |---|---|---|
   | never claimed | none | the task in the config tree |
   | claimed, in progress, partial, in review, awaiting merge | `task-lock/<task-id>`; `lease` set while someone works on it | `status.json` at the branch tip |
-  | accepted | deleted after a grace period | `done/<task-id>.json` in the config repo, plus the `archive` branch |
-  | cancelled | deleted after a grace period (at once if the task left the tree) | `cancelled/<task-id>.json`, plus the `archive` branch |
+  | accepted | deleted after a grace period | `tasks/<task-id>/done.json` in the config repo, plus the `archive` branch |
+  | cancelled | deleted after a grace period (at once if the task left the tree) | `tasks/<task-id>/cancelled.json`, plus the `archive` branch |
 
   A cancelled task is never claimed again, but unlike a done one it does not satisfy other tasks' dependencies. The post-claim re-check below looks for either record.
 
 - **Retiring a branch**, in this order, each step idempotent:
   1. `accept` is committed on the lock branch (`need = done`; no further event is legal, `done_final`).
-  2. The admin commits `done/<task-id>.json` to the config repo: the final `status.json` plus the lock tip SHA. This file is the durable "done" record. It lives outside the task's directory, so it does not change the task's `spec`.
+  2. The admin commits `tasks/<task-id>/done.json` to the config repo: the final `status.json` plus the lock tip SHA. This file is the durable "done" record. It sits beside the task's TASK.md, but the task's `spec` leaves it out, so it does not change the spec.
   3. The admin adds a commit to the single `archive` branch of `fleet-coord` whose second parent is the lock tip, so the task's full history stays reachable after its branch is gone.
   4. After a grace period (default 1 hour from step 2), the admin deletes the lock branch. The admin bypasses the deletion rule; workers still cannot delete.
-- **Done means `done/<task-id>.json` exists.** Without it, a deleted branch would look like a task nobody has claimed. A worker could have fetched the config repo before the done record was written, and its claim could land after the branch was deleted. So the worker checks twice:
+- **Done means `tasks/<task-id>/done.json` exists** (or, from before records moved beside their tasks, `done/<task-id>.json`). The record is not part of the task: its `spec` hashes the task's directory without it, so writing it changes no spec; a task removed from the tree keeps a directory holding only its record. Without it, a deleted branch would look like a task nobody has claimed. A worker could have fetched the config repo before the done record was written, and its claim could land after the branch was deleted. So the worker checks twice:
   1. Before claiming it skips tasks with a done record. This is only a filter that avoids wasted claims.
   2. **After a claim that created the branch** it fetches the config repo again and looks for the done record. This check is the guarantee. A claim can create the branch only while it is absent, and for a done task the branch is absent only after the admin deleted it, which happens only after the done record was committed. The second fetch starts after the claim landed, so it sees the record. No clock or timing assumption is involved.
 
@@ -222,8 +222,8 @@ loop:
 | Input | Read from | If it is stale |
 |---|---|---|
 | `need`, `lease`, `epoch`, `author`, `strikes` | the task's lock branch, in the same read whose tip the CAS expects | The CAS rejects the claim (`Log.stale_rejected`; the git test pushes 190 such stale writes and all are rejected) |
-| Dependencies done | `done/<task-id>.json` in the config repo | Harmless: only the admin writes done records and never removes them, so a stale read can only say "not done yet" |
-| The task is not done | `done/<task-id>.json` in the config repo | Re-checked after a claim that created the branch; exact, see "Retiring a branch" in section 4 |
+| Dependencies done | `tasks/<task-id>/done.json` in the config repo | Harmless: only the admin writes done records and never removes them, so a stale read can only say "not done yet" |
+| The task is not done | `tasks/<task-id>/done.json` in the config repo | Re-checked after a claim that created the branch; exact, see "Retiring a branch" in section 4 |
 | The task exists, its `TASK.md`, `task.toml`, `project.toml` | the config repo | Not covered by the CAS. Handled by `spec` (below) |
 | `STATUS.md` in the config repo | derived by the admin | Never an input. It is a summary for humans |
 
@@ -392,14 +392,14 @@ A stateless, level-triggered reconciler. Every sweep derives what to do from wha
 | Observed | Action |
 |---|---|
 | Lock branch for a task id that is not in the tree | `cancel` (fences a holder), archive, delete |
-| `need = cancelled`, no `cancelled/<task-id>.json` | write it, archive; delete the branch after the grace period |
+| `need = cancelled`, no `tasks/<task-id>/cancelled.json` | write it, archive; delete the branch after the grace period |
 | `afe-fleet admin cancel <task> [--remove]` | `cancel`, record it, and with `--remove` delete `tasks/<task-id>/` from the tree |
 | Leased, tip unchanged for TTL across my own successful polls | `expire` |
 | Leased, and the lease's `spec` differs from the task's current content hash | `expire` (reason `spec-changed`) |
 | `need` is `review` or `merge`, and `pr.spec` differs from the current content hash | `rework` (reason `spec-changed`) |
 | `need = merge`, PR head = `reviewed_sha`, required checks green, mergeable | merge with the API's `sha` guard, then `accept` |
 | `need = merge`, PR already merged | `accept` (crash between merge and accept, or a human merged) |
-| `need = done`, no `done/<task-id>.json` | write it, then add the lock tip to the `archive` branch |
+| `need = done`, no `tasks/<task-id>/done.json` | write it, then add the lock tip to the `archive` branch |
 | `need = done`, done record older than the grace period | delete the lock branch |
 | Lock branch for a task that has a done record, `need ≠ done` | delete it (a claim from a stale tree; its worker has already stopped, or crashed before checking) |
 | `need = merge`, checks red, conflict, or head moved | `rework` with the reason and log excerpt |
