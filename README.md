@@ -132,6 +132,33 @@ repairs = 2
 # effort = "high"
 ```
 
+### Running the agent's tools in a container
+
+With `runtime = "container"`, `claude` still runs on the host with your login, but its tools
+(Bash, Read, Write, Edit, NotebookEdit) act only inside a container made for each attempt from
+the project's `image`. It loads the [`container-tools`](src/afe_fleet/container-tools/) plugin
+shipped in the package, and every other host tool and all MCP servers are removed. The worktree
+(with its git directory) and the attempt's task, out and home directories are mounted at their
+own paths. The container is removed after the attempt; verify runs in a fresh one.
+
+```toml
+[agent]
+runtime = "container"
+# network = "none"                        # docker's default network unless set
+mounts = ["~/.cache/afe-fleet/container:/cache"]   # caches, shared between attempts
+env = { XDG_CACHE_HOME = "/cache" }      # set in the container
+# docker_args = ["--memory", "16g", "--cpus", "4"]
+```
+
+```toml
+# tasks/<project>/project.toml
+image = "afe-c-agent:pilot"               # needs /bin/sh, base64 and git; bash if tasks use it
+```
+
+The image is pulled if missing. The container runs as your uid, so files in the worktree stay
+yours; `HOME` inside it is the attempt's empty `home/`. `--dangerously-skip-permissions` is not
+needed in this mode: the plugin allows the contained tools itself.
+
 ### Models and effort
 
 `model` and `effort` can be set in `task.toml`, `project.toml` and the host config, each in an

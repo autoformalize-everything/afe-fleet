@@ -24,8 +24,8 @@
     "network": {
       "type": "string",
       "title": "Network",
-      "description": "NetworkMode for a container this plugin creates (env CONTAINER_TOOLS_NETWORK)",
-      "default": "none"
+      "description": "NetworkMode for a container this plugin creates; empty: docker's default (env CONTAINER_TOOLS_NETWORK)",
+      "default": ""
     },
     "mounts": {
       "type": "string",

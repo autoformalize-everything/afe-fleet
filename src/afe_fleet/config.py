@@ -114,14 +114,18 @@ class FleetConfig:
 
 @dataclass
 class AgentConfig:
-    runtime: str = "local"  # "local": directly on this machine | "docker" (not used for now)
+    # "local": directly on this machine | "container": claude on this machine, its tools in a
+    # per-attempt container (container-tools plugin) | "docker": claude itself in a container (unused)
+    runtime: str = "local"
     isolate_home: bool = False  # local runtime: give the agent an empty per-attempt HOME
     command: list[str] = field(default_factory=lambda: [
         "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--dangerously-skip-permissions"])
-    mounts: list[str] = field(default_factory=list)  # extra docker -v specs, e.g. creds read-only
+    mounts: list[str] = field(default_factory=list)  # extra docker -v specs, e.g. caches or creds read-only
     env: dict[str, str] = field(default_factory=dict)
     docker_args: list[str] = field(default_factory=list)
+    network: str = ""  # container runtime: --network of the attempt's container ("": docker's default)
+    plugin_dir: str = ""  # container runtime: the container-tools plugin (default: the one shipped here)
     max_wall: float = 4 * 3600
     stall: float = 20 * 60
     repairs: int = 2
@@ -153,7 +157,7 @@ class HostConfig:
         default_id = f"{gh_user or getpass.getuser()}/{socket.gethostname()}"
         agent = AgentConfig()
         for k in ("runtime", "command", "mounts", "env", "docker_args", "repairs", "isolate_home",
-                  "model_args", "effort_args"):
+                  "model_args", "effort_args", "network", "plugin_dir"):
             if k in a:
                 setattr(agent, k, a[k])
         agentchoice.validate(a, str(path))
@@ -171,8 +175,8 @@ class HostConfig:
             filters=tuple(overrides.get("filters") or w.get("filters", ())),
             allow_self_review=bool(w.get("allow_self_review", False)), push=w.get("push", "origin"),
             git_protocol=w.get("git_protocol", "ssh"), agent=agent)
-        if agent.runtime not in ("docker", "local"):
-            raise ValueError(f"{path}: [agent] runtime must be docker or local")
+        if agent.runtime not in ("container", "docker", "local"):
+            raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
         return host
 
 

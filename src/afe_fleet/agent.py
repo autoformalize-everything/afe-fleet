@@ -11,6 +11,15 @@ agent exits. The agent's own claim of success is never trusted.
 
 Liveness: any stdout line counts. No output for `stall` seconds, or the wall-clock limit, or a
 cancel (lease lost, shutdown) kills the whole process tree (and the container).
+
+Runtimes:
+  * local: the agent CLI runs on this machine, as you, in the worktree.
+  * container: the agent CLI runs on this machine (your login, transcripts here), but with the
+    container-tools plugin, so its tools act only inside a container made for the attempt from
+    the project's image and removed after it. The worktree, its git directory and the task,
+    out and home directories are mounted at their own paths, so every path means the same on
+    both sides; `mounts` adds caches and the like.
+  * docker: the agent CLI itself in a container (kept, unused).
 """
 
 from __future__ import annotations
@@ -30,6 +39,12 @@ from .agentchoice import AgentChoice, cli_args
 from .config import AgentConfig
 
 log = logging.getLogger(__name__)
+
+# The container-tools plugin, shipped inside this package.
+PLUGIN_DIR = Path(__file__).resolve().parent / "container-tools"
+
+# The attempt's container only has to stay up: the tools exec into it.
+KEEPALIVE = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
 
 WRAP_UP = ("Time is almost up. Commit what you have now, write /out/result.json (or "
            "/out/review.json) describing what is done and what is not, and stop.")
@@ -82,17 +97,22 @@ class AgentRun:
 
 
 class Runtime:
-    def __init__(self, cfg: AgentConfig, image: str | None, name: str, label: str):
+    def __init__(self, cfg: AgentConfig, image: str | None, name: str, label: str,
+                 identity: tuple[str, str] | None = None):
         self.cfg = cfg
         self.image = image
         self.name = name  # container name; unique per worker slot
         self.label = label
+        self.identity = identity  # (name, email) for the agent's commits in a container
 
     def paths(self, ws: Workspace) -> dict[str, str]:
         """Where the agent sees the task files and writes its result, for the prompt."""
-        if self.cfg.runtime == "local":
+        if self.cfg.runtime in ("local", "container"):
             return {"task_dir": str(ws.task), "out_dir": str(ws.out)}
         return {"task_dir": "/task", "out_dir": "/out"}
+
+    def plugin_dir(self) -> Path:
+        return Path(os.path.expanduser(self.cfg.plugin_dir)) if self.cfg.plugin_dir else PLUGIN_DIR
 
     def agent_argv(self, ws: Workspace, extra: list[str] | None = None) -> tuple[list[str], dict[str, str], Path]:
         """The agent command line; `extra` (model, effort flags) goes after the configured command."""
@@ -105,7 +125,16 @@ class Runtime:
                 env["HOME"] = str(ws.home)
             return [os.path.expanduser(a) for a in self.cfg.command] + extra, env, ws.work
         if not self.image:
-            raise ValueError("project.toml has no image; docker runtime needs one")
+            raise ValueError(f"project.toml has no image; the {self.cfg.runtime} runtime needs one")
+        if self.cfg.runtime == "container":
+            # Your login and settings, as for local; the plugin sends the tools to the container
+            # start() made (it never creates one) and removes every other tool and MCP server.
+            env = {**os.environ, "AFE_WORK": str(ws.work), "AFE_TASK": str(ws.task), "AFE_OUT": str(ws.out),
+                   "CONTAINER_TOOLS_CONTAINER": self.name, "CONTAINER_TOOLS_IMAGE": "",
+                   "CONTAINER_TOOLS_WORKDIR": str(ws.work), "CONTAINER_TOOLS_PERMISSIONS": "allow"}
+            argv = [os.path.expanduser(a) for a in self.cfg.command]
+            argv += ["--plugin-dir", str(self.plugin_dir()), "--strict-mcp-config", *extra]
+            return argv, env, ws.work
         argv = ["docker", "run", "--rm", "-i", "--name", self.name, "--label", f"afe-fleet={self.label}",
                 "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges", "-w", "/work",
@@ -118,23 +147,85 @@ class Runtime:
         argv += [*self.cfg.docker_args, self.image, *self.cfg.command, *extra]
         return argv, dict(os.environ), ws.root
 
+    def _container_args(self, ws: Workspace, name: str) -> list[str]:
+        """`docker run` options for the container runtime: the attempt's directories at their own
+        paths (the worktree's git directory too, so commits work), as you, nothing extra allowed."""
+        args = ["--name", name, "--label", f"afe-fleet={self.label}", "--init",
+                "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "-w", str(ws.work), "-e", f"HOME={ws.home}"]
+        if self.cfg.network:
+            args += ["--network", self.cfg.network]
+        mounts = [f"{ws.work}:{ws.work}", f"{ws.task}:{ws.task}:ro", f"{ws.out}:{ws.out}", f"{ws.home}:{ws.home}"]
+        common = _git_common_dir(ws.work)
+        if common is not None and not common.is_relative_to(ws.work):
+            mounts.append(f"{common}:{common}")
+        mounts += [os.path.expanduser(m) for m in self.cfg.mounts]
+        for m in mounts:
+            args += ["-v", m]
+        env = dict(self.cfg.env)
+        if self.identity:
+            name_, email = self.identity
+            env.update(GIT_AUTHOR_NAME=name_, GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=name_,
+                       GIT_COMMITTER_EMAIL=email)
+        for k, v in env.items():
+            args += ["-e", f"{k}={v}"]
+        return args + list(self.cfg.docker_args)
+
+    def start(self, ws: Workspace) -> None:
+        """Container runtime: create and start the attempt's container (pulling the image if
+        needed). Raises RuntimeError with docker's message when it cannot."""
+        if self.cfg.runtime != "container":
+            return
+        argv = ["docker", "run", "-d", *self._container_args(ws, self.name), "--entrypoint", "/bin/sh",
+                self.image, "-c", KEEPALIVE]
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("docker run timed out") from None
+        if p.returncode != 0:
+            raise RuntimeError(f"docker run failed: {(p.stderr or p.stdout).strip()[-2000:]}")
+
+    def stop(self) -> None:
+        """Container runtime: remove the attempt's container. Never raises."""
+        if self.cfg.runtime == "container":
+            try:
+                subprocess.run(["docker", "rm", "-f", self.name], capture_output=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log.warning("could not remove container %s: %s", self.name, e)
+
     def verify_argv(self, ws: Workspace, cmd: list[str]) -> tuple[list[str], Path]:
         if self.cfg.runtime == "local":
             return cmd, ws.work
+        if self.cfg.runtime == "container":
+            # a fresh container from the same image and mounts: nothing the agent left running
+            return ["docker", "run", "--rm", *self._container_args(ws, self.name + "-verify"), self.image,
+                    *cmd], ws.work
         return (["docker", "run", "--rm", "--name", self.name + "-verify", "--label", f"afe-fleet={self.label}",
                  "--user", f"{os.getuid()}:{os.getgid()}", "-w", "/work", "-v", f"{ws.work}:/work",
                  "-e", "HOME=/tmp", self.image, *cmd], ws.root)
 
-    def kill(self) -> None:
-        if self.cfg.runtime == "docker":
-            subprocess.run(["docker", "kill", self.name], capture_output=True, timeout=60)
+    def kill(self, verify: bool = False) -> None:
+        """Kill the agent's container, or with `verify` the verify container."""
+        if self.cfg.runtime in ("docker", "container"):
+            subprocess.run(["docker", "kill", self.name + ("-verify" if verify else "")], capture_output=True,
+                           timeout=60)
 
     def remove_strays(self) -> None:
         """Containers are children of the docker daemon, not of us: a crashed worker leaves
         them running. Remove any with this slot's name before starting."""
-        if self.cfg.runtime == "docker":
+        if self.cfg.runtime in ("docker", "container"):
             for n in (self.name, self.name + "-verify"):
                 subprocess.run(["docker", "rm", "-f", n], capture_output=True, timeout=60)
+
+
+def _git_common_dir(work: Path) -> Path | None:
+    """The repository directory a worktree's `.git` file points into, or None."""
+    try:
+        p = subprocess.run(["git", "-C", str(work), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return Path(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else None
 
 
 def run_verify(rt: Runtime, ws: Workspace, cmd: list[str] | None, timeout: float) -> Verify:
@@ -145,7 +236,7 @@ def run_verify(rt: Runtime, ws: Workspace, cmd: list[str] | None, timeout: float
         p = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                            start_new_session=True)
     except subprocess.TimeoutExpired as e:
-        rt.kill()
+        rt.kill(verify=True)
         return Verify(False, f"verify timed out after {timeout:.0f}s\n{(e.stdout or '')[-4000:]}")
     out = (p.stdout + p.stderr)[-8000:]
     return Verify(p.returncode == 0, out)
@@ -179,9 +270,15 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
     argv, env, cwd = rt.agent_argv(ws, cli_args(choice or AgentChoice(), cfg.model_args, cfg.effort_args))
     rt.remove_strays()
     try:
+        rt.start(ws)
+    except RuntimeError as e:
+        rt.stop()
+        return AgentRun("error", None, errors=[f"cannot start the agent's container: {e}"])
+    try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, start_new_session=True, text=True, bufsize=1)
     except OSError as e:
+        rt.stop()
         return AgentRun("error", None, errors=[f"cannot start agent: {e}"])
 
     run = AgentRun("exit", None)
@@ -273,5 +370,6 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             except (ProcessLookupError, PermissionError):
                 pass
         t.join(10)
+        rt.stop()
     run.exit_code = proc.returncode
     return run

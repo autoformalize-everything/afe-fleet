@@ -14,6 +14,9 @@ container, while `claude` itself, its login and its transcripts stay on the host
 - The system prompt gains a short section saying where the tools run and what the working
   directory is.
 
+afe-fleet's `runtime = "container"` uses it this way (see the top-level README): it creates the
+container, starts `claude` with the plugin, and removes the container afterwards.
+
 Requires Claude Code with function-hooks support (written against 2.1.325; the API is early
 access).
 
@@ -21,7 +24,7 @@ access).
 
 ```sh
 CONTAINER_TOOLS_CONTAINER=my-box CONTAINER_TOOLS_IMAGE=ubuntu:latest CONTAINER_TOOLS_WORKDIR=/work \
-  claude --plugin-dir /path/to/afe-fleet/container-tools
+  claude --plugin-dir /path/to/afe-fleet/src/afe_fleet/container-tools
 ```
 
 Headless (`-p`) works the same. Add `--allowedTools ...` or `CONTAINER_TOOLS_PERMISSIONS=allow`,
@@ -37,7 +40,7 @@ Each option is a `userConfig` field (`/config`, or `pluginConfigs` in settings).
 | `container` | `CONTAINER_TOOLS_CONTAINER` | `claude-sandbox` | name or id |
 | `image` | `CONTAINER_TOOLS_IMAGE` | (none) | create the container from this when it is missing; empty: never create |
 | `workdir` | `CONTAINER_TOOLS_WORKDIR` | the container's | Bash starts here (created if missing) |
-| `network` | `CONTAINER_TOOLS_NETWORK` | `none` | `NetworkMode` of a container the plugin creates |
+| `network` | `CONTAINER_TOOLS_NETWORK` | docker's default | `NetworkMode` of a container the plugin creates (`none` cuts it off) |
 | `mounts` | `CONTAINER_TOOLS_MOUNTS` | (none) | comma-separated `host:ctr[:ro]` binds of a container the plugin creates |
 | `user` | `CONTAINER_TOOLS_USER` | the container's | user for creation and for every exec |
 | `permissions` | `CONTAINER_TOOLS_PERMISSIONS` | `session` | `session`: follow the session's rules and mode (an ask becomes a Yes/No question; headless, a refusal). `allow`: run whatever the rules do not explicitly deny |
@@ -89,6 +92,6 @@ are not supported.
 ## Tests
 
 ```sh
-claude plugin validate container-tools
-claude plugin test container-tools      # pure helpers and the fail-closed paths
+claude plugin validate src/afe_fleet/container-tools
+claude plugin test src/afe_fleet/container-tools      # pure helpers and the fail-closed paths
 ```

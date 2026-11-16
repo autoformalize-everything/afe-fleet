@@ -152,7 +152,7 @@ async function create($: $, cfg: Config): Promise<void> {
     WorkingDir: cfg.workdir || undefined,
     User: cfg.user || undefined,
     Labels: { 'afe-fleet.container-tools': '1' },
-    HostConfig: { Init: true, NetworkMode: cfg.network || 'none', Binds: cfg.mounts.length ? cfg.mounts : undefined },
+    HostConfig: { Init: true, NetworkMode: cfg.network || undefined, Binds: cfg.mounts.length ? cfg.mounts : undefined },
   }
   const path = `/containers/create?name=${enc(cfg.container)}`
   let res = await request($, 'POST', path, spec)

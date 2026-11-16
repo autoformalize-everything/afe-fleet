@@ -253,10 +253,11 @@ On start the worker reads it and asks the backend whether the lease is still its
 **Every external side effect has a deterministic key and is read back before retry.**
 Work branch name `task/<task-id>/e<epoch>`; PR found by head branch before creating; review comments carry `<!-- afe-fleet task=… epoch=… sha=… -->`.
 
-**Where the agent runs.** For now, directly on the worker's machine, as the worker's user, with the user's `HOME`: the agent CLI uses the operator's normal login (`claude auth login`, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`). Running in containers is deferred; the `docker` runtime in `agent.py` is kept but not used. What this costs:
+**Where the agent runs.** The agent CLI always runs on the worker's machine, as the worker's user, with the user's `HOME`: it uses the operator's normal login (`claude auth login`, or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`). Where its tools act depends on `[agent] runtime`:
 
-- The agent can do anything the user can, including reading the worker's GitHub credential. Use a dedicated machine or user account for workers.
-- There is no network restriction and no resource limit per agent. Killing an agent kills its process group; children that leave the group (daemons, `setsid`) can survive it.
+- `local` (default): on the machine. The agent can do anything the user can, including reading the worker's GitHub credential, with no network restriction and no resource limit; use a dedicated machine or user account. Killing an agent kills its process group; children that leave the group (daemons, `setsid`) can survive it.
+- `container`: in a container made for the attempt from the project's `image`, through the `container-tools` plugin shipped in the package (`src/afe_fleet/container-tools/`). The plugin answers Bash, Read, Write, Edit and NotebookEdit inside the container over the Docker Engine API and removes every other tool that reaches the machine; `--strict-mcp-config` starts no MCP servers. The container runs as the worker's uid with all capabilities dropped, on docker's default network unless `network` names another (`none` cuts it off). The worktree, the shared clone's git directory (so commits work), and the attempt's `task/`, `out/` and `home/` are mounted at their own paths, so the agent's working directory, the prompt's paths and git's worktree links mean the same on both sides; `mounts` adds caches. Verify runs in a fresh container with the same mounts. The container is removed when the attempt ends; a crashed worker's is removed by name before the slot's next attempt. Only one process holds the login, so the OAuth refresh problem below does not arise. The agent still writes to the shared clone's object store and can read anything mounted.
+- `docker`: the agent CLI itself in a container. Kept, unused, untested.
 
 **Checkouts: one shared clone per repository, one worktree per attempt.**
 
@@ -526,5 +527,6 @@ The reference project is about 200,000 lines of Python. This one is a Python pac
 | GitHub API (`gh`) | `forge.py` | written, **not exercised by any test** |
 | Local runtime with a real agent CLI | `agent.py` | written, **not exercised by any test** (the fake agent covers the protocol) |
 | Shared clone with a worktree per attempt, file-locked across processes | `repocache.py` | done, tested (concurrent attempts, cross-process lock, crash cleanup) |
-| Docker runtime | `agent.py` | deferred; code kept, unused |
+| Container runtime: tools in a per-attempt container via the `container-tools` plugin | `agent.py`, `container-tools/` | done; lifecycle and verify tested with docker, one end-to-end attempt run by hand with the real agent CLI |
+| Docker runtime (agent CLI in the container) | `agent.py` | deferred; code kept, unused |
 | Not yet: workspace checkpoints on heartbeat, resuming an agent session after a worker restart (the worker releases the lease instead), closing superseded PRs, repair commits for illegal writes, escalation labels | | |

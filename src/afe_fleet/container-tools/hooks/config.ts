@@ -47,7 +47,7 @@ export async function loadConfig($: EngineInterface, options: PluginOptions): Pr
     container: pick('container', 'claude-sandbox'),
     image: pick('image', ''),
     workdir: pick('workdir', ''),
-    network: pick('network', 'none'),
+    network: pick('network', ''),
     mounts: list(pick('mounts', '')),
     user: pick('user', ''),
     permissions: permissions === 'allow' ? 'allow' : 'session',

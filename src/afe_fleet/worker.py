@@ -259,9 +259,9 @@ class Worker:
         return agentchoice.choose(kind, a.choice_cli, td.meta.get("agent"), td.project.get("agent"), a.choice_table,
                                   agentchoice.DEFAULTS)
 
-    def _runtime(self, td: TaskDef) -> Runtime:
+    def _runtime(self, td: TaskDef, wt) -> Runtime:
         return Runtime(self.host.agent, td.project.get("image"), f"afe-fleet-{self.fleet.name}-{self.slot}",
-                       self.fleet.name)
+                       self.fleet.name, identity=(wt.git.name, wt.git.email))
 
     def _write_task_files(self, ws: Workspace, lease: Lease, td: TaskDef, rev: str, kind: str) -> None:
         text = self.loaded.config.task_text(rev, td.id) if rev else ""  # per-slot ConfigRepo
@@ -298,7 +298,7 @@ class Worker:
         self.journal.write(step="prepared", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease))
 
-        rt = self._runtime(td)
+        rt = self._runtime(td, wt)
         verify_cmd = td.meta.get("verify", proj.get("verify"))  # task.toml overrides project.toml
         prompt = WORK_PROMPT.format(task=lease.task, extra=proj.get("prompt", ""), **rt.paths(ws))
         choice = self._choice(td, "work")
@@ -411,7 +411,7 @@ class Worker:
         wt = repo.add(ws.work, sha, refs=[pr_ref])
         lease.extra["worktree"] = wt
         self._write_task_files(ws, lease, td, rev, "review")
-        rt = self._runtime(td)
+        rt = self._runtime(td, wt)
         prompt = REVIEW_PROMPT.format(task=lease.task, sha=sha, base=proj.get("base", "main"),
                                       extra=proj.get("review_prompt", ""), **rt.paths(ws))
         choice = self._choice(td, "review")
