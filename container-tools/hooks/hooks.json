@@ -1,0 +1,16 @@
+{
+  "modules": ["./register.ts"],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"$CONTAINER_TOOLS_ACTIVE\" = 1 ] && exit 0; echo 'container-tools is not running, so this tool would act on the host: refused.' >&2; exit 2"
+          }
+        ]
+      }
+    ]
+  }
+}

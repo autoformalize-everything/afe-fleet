@@ -1,0 +1,68 @@
+{
+  "name": "container-tools",
+  "version": "0.1.0",
+  "description": "Runs Bash, Read, Write, Edit and NotebookEdit inside a Docker container (Engine API over the socket) and removes every other host-facing tool",
+  "userConfig": {
+    "container": {
+      "type": "string",
+      "title": "Container",
+      "description": "Name or id of the container the tools run in (env CONTAINER_TOOLS_CONTAINER)",
+      "default": "claude-sandbox"
+    },
+    "image": {
+      "type": "string",
+      "title": "Image",
+      "description": "Create the container from this image when it does not exist; empty: never create (env CONTAINER_TOOLS_IMAGE)",
+      "default": ""
+    },
+    "workdir": {
+      "type": "string",
+      "title": "Working directory",
+      "description": "Working directory inside the container; empty: the container's own (env CONTAINER_TOOLS_WORKDIR)",
+      "default": ""
+    },
+    "network": {
+      "type": "string",
+      "title": "Network",
+      "description": "NetworkMode for a container this plugin creates (env CONTAINER_TOOLS_NETWORK)",
+      "default": "none"
+    },
+    "mounts": {
+      "type": "string",
+      "title": "Mounts",
+      "description": "Comma-separated binds host:container[:ro] for a container this plugin creates (env CONTAINER_TOOLS_MOUNTS)",
+      "default": ""
+    },
+    "user": {
+      "type": "string",
+      "title": "User",
+      "description": "User the tools run as in the container; empty: the container's (env CONTAINER_TOOLS_USER)",
+      "default": ""
+    },
+    "permissions": {
+      "type": "string",
+      "title": "Permissions",
+      "description": "session: follow the session's permission rules and mode; allow: run every call the rules do not deny (env CONTAINER_TOOLS_PERMISSIONS)",
+      "default": "session",
+      "options": ["session", "allow"]
+    },
+    "extraTools": {
+      "type": "string",
+      "title": "Extra tools",
+      "description": "Comma-separated tool names to keep beside the default set, e.g. WebFetch (env CONTAINER_TOOLS_EXTRA_TOOLS)",
+      "default": ""
+    },
+    "tmpdir": {
+      "type": "string",
+      "title": "Scratch directory",
+      "description": "Directory in the container for the plugin's run files; must not be a tmpfs mount (env CONTAINER_TOOLS_TMPDIR)",
+      "default": "/tmp"
+    },
+    "startAttempts": {
+      "type": "number",
+      "title": "Start attempts",
+      "description": "How many times to try bringing the container up before the tool call fails (env CONTAINER_TOOLS_START_ATTEMPTS)",
+      "default": 3
+    }
+  }
+}
