@@ -65,12 +65,23 @@ def normalize_effort(level: object) -> str:
 class AgentChoice:
     model: str | None = None
     effort: str | None = None
+    cli: str = "claude"
 
     def to_json(self) -> dict:
-        return {"model": self.model, "effort": self.effort}
+        out = {"model": self.model, "effort": self.effort}
+        return out if self.cli == "claude" else {**out, "cli": self.cli}
 
     def describe(self) -> str:
-        return f"{self.model or 'default model'}, {self.effort or 'default'} effort"
+        prefix = "" if self.cli == "claude" else f"{self.cli}: "
+        return f"{prefix}{self.model or 'default model'}, {self.effort or 'default'} effort"
+
+    def for_cli(self, cli: str) -> AgentChoice:
+        """The choice as another agent CLI takes it. Models here are Claude models, so Codex keeps its
+        own configured model (set one with -m in the command); effort carries over, `max` as `xhigh`."""
+        if cli == "claude":
+            return self
+        effort = "xhigh" if self.effort == "max" else self.effort
+        return AgentChoice(None, effort, cli)
 
 
 def _fields(table: object, kind: str) -> list[dict]:

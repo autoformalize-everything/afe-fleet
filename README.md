@@ -159,6 +159,34 @@ The image is pulled if missing. The container runs as your uid, so files in the 
 yours; `HOME` inside it is the attempt's empty `home/`. `--dangerously-skip-permissions` is not
 needed in this mode: the plugin allows the contained tools itself.
 
+### Codex as the agent
+
+```toml
+[agent]
+cli = "codex"              # default command: ["codex", "exec", "--json"]
+runtime = "container"      # or "local"
+```
+
+Each turn is one `codex exec --json` process (the prompt on stdin); repairs and the wrap-up are
+`codex exec resume <thread>` turns of the same session. Codex keeps its own configured model
+(`model` settings in the task tree name Claude models; put `-m <model>` in `command` to pick
+one); `effort` is passed as `-c model_reasoning_effort=…`, `max` as `xhigh`.
+
+In the container runtime Codex runs on the host with your login, but every command, file read
+and patch goes through `codex-exec-server` inside the attempt's container: the static binary
+next to `codex` is mounted read-only (`codex_exec_server` to use another), and a per-attempt
+`CODEX_HOME` (your `auth.json` symlinked, `config.toml` copied) has an `environments.toml` whose
+only environment spawns `docker exec -i <container> codex-exec-server --listen stdio`. No port is
+opened, and there is no fallback to the host. Codex's own sandbox (bubblewrap) cannot run in a
+container, so it is off there (`-s danger-full-access`); the container is the sandbox. Codex's
+session files live in that per-attempt home and are removed with the attempt.
+
+Why a per-attempt `CODEX_HOME` (a workaround, as of Codex 0.167): a stdio exec-server can only be
+named in `$CODEX_HOME/environments.toml` (`program = …`), which has no path override and no `-c`
+equivalent. The one setting outside it, `CODEX_EXEC_SERVER_URL`, takes only `ws://`/`wss://` and
+carries no auth token, so it would need container networking and an unauthenticated port. If
+Codex gains a CLI flag for a stdio executor, `Runtime.codex_env` is the one place to change.
+
 ### Models and effort
 
 `model` and `effort` can be set in `task.toml`, `project.toml` and the host config, each in an

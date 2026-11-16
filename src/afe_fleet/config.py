@@ -112,11 +112,20 @@ class FleetConfig:
         return cfg
 
 
+# What `cli = "codex"` changes in the agent defaults (explicit settings still win).
+CODEX_DEFAULTS = {"codex": {
+    "command": ["codex", "exec", "--json"],
+    "model_args": ["-m", "{model}"],
+    "effort_args": ["-c", "model_reasoning_effort={effort}"],
+}}
+
+
 @dataclass
 class AgentConfig:
     # "local": directly on this machine | "container": claude on this machine, its tools in a
     # per-attempt container (container-tools plugin) | "docker": claude itself in a container (unused)
     runtime: str = "local"
+    cli: str = "claude"  # the agent CLI: "claude" (stream-json over stdin) | "codex" (codex exec --json)
     isolate_home: bool = False  # local runtime: give the agent an empty per-attempt HOME
     command: list[str] = field(default_factory=lambda: [
         "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -126,6 +135,7 @@ class AgentConfig:
     docker_args: list[str] = field(default_factory=list)
     network: str = ""  # container runtime: --network of the attempt's container ("": docker's default)
     plugin_dir: str = ""  # container runtime: the container-tools plugin (default: the one shipped here)
+    codex_exec_server: str = ""  # container runtime, codex: static exec-server binary (default: next to codex)
     max_wall: float = 4 * 3600
     stall: float = 20 * 60
     repairs: int = 2
@@ -156,8 +166,13 @@ class HostConfig:
         gh_user = overrides.get("gh_user") or w.get("gh_user")
         default_id = f"{gh_user or getpass.getuser()}/{socket.gethostname()}"
         agent = AgentConfig()
-        for k in ("runtime", "command", "mounts", "env", "docker_args", "repairs", "isolate_home",
-                  "model_args", "effort_args", "network", "plugin_dir"):
+        cli_name = a.get("cli", "claude")
+        if cli_name not in ("claude", "codex"):
+            raise ValueError(f"{path}: [agent] cli must be claude or codex")
+        for k, v in CODEX_DEFAULTS.get(cli_name, {}).items():
+            setattr(agent, k, list(v))
+        for k in ("runtime", "cli", "command", "mounts", "env", "docker_args", "repairs", "isolate_home",
+                  "model_args", "effort_args", "network", "plugin_dir", "codex_exec_server"):
             if k in a:
                 setattr(agent, k, a[k])
         agentchoice.validate(a, str(path))
@@ -177,6 +192,8 @@ class HostConfig:
             git_protocol=w.get("git_protocol", "ssh"), agent=agent)
         if agent.runtime not in ("container", "docker", "local"):
             raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
+        if agent.cli == "codex" and agent.runtime == "docker":
+            raise ValueError(f"{path}: [agent] cli = codex needs runtime local or container")
         return host
 
 

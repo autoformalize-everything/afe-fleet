@@ -257,7 +257,7 @@ class Worker:
     def _choice(self, td: TaskDef, kind: str) -> AgentChoice:
         a = self.host.agent
         return agentchoice.choose(kind, a.choice_cli, td.meta.get("agent"), td.project.get("agent"), a.choice_table,
-                                  agentchoice.DEFAULTS)
+                                  agentchoice.DEFAULTS).for_cli(a.cli)
 
     def _runtime(self, td: TaskDef, wt) -> Runtime:
         return Runtime(self.host.agent, td.project.get("image"), f"afe-fleet-{self.fleet.name}-{self.slot}",
