@@ -28,11 +28,17 @@ repos/<repo>-<hash>.git            code repositories, cloned once per machine an
                                    worker slot and process
 mirrors/                           config-repo mirrors
 fleets/<fleet>/attempts/<task>-e<epoch>/work   a git worktree per attempt
-fleets/<fleet>/journal-<slot>.json, lock-<slot>.git, server.sqlite
+fleets/<fleet>/workers/<worker-id>/     one worker process's journal and mirrors, per slot
+fleets/<fleet>/admin/, server.sqlite
 ```
 
 Configuration stays in `~/.config/afe-fleet/<fleet>.toml` (per host) and
 `~/.config/systemd/user/` (services).
+
+Several worker processes can run on one host in one home, for example one per agent CLI: give
+each its own `--id` (and usually its own `--host-config`). Each process keeps its journal,
+mirrors and container names under its worker id and holds a lock on it, so a second process
+with the same id refuses to start.
 
 ```sh
 uv tool install git+https://github.com/autoformalize-everything/afe-fleet   # as a tool

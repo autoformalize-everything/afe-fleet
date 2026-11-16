@@ -9,6 +9,7 @@ default branch holds `fleet.toml`, or a path to a `fleet.toml` file.
 
 from __future__ import annotations
 
+import fcntl
 import getpass
 import hashlib
 import os
@@ -41,11 +42,16 @@ def data_home() -> Path:
 
         ~/.local/share/afe-fleet/
           repos/<repo>-<hash>.git, .lock     shared code clones (hold attempts' unpushed commits)
-          mirrors/<hash>.git                 config-repo mirrors
-          fleets/<fleet>/lock-<slot>.git     lock-repo mirrors
-          fleets/<fleet>/journal-<slot>.json
+          mirrors/<hash>.git                 config-repo mirrors (fleet.toml)
+          fleets/<fleet>/workers/<worker-id>/          one worker process's own state, held by
+            lock                                       an exclusive lock while the process runs
+            slot-<n>/{journal.json,lock.git,config.git}   crash journal, lock- and config-repo mirrors
+          fleets/<fleet>/admin/{lock,lock.git}         the admin's (one per fleet on a host)
           fleets/<fleet>/attempts/<task>-e<epoch>/{work,task,out}   worktree per attempt
           fleets/<fleet>/server.sqlite       server mode
+
+    Any number of worker processes, with different worker ids, share one home: per-process state
+    is under its worker id, the shared clones are file-locked, and attempts are unique per lease.
 
     `$AFE_FLEET_HOME` overrides the whole directory; otherwise `$XDG_DATA_HOME/afe-fleet`.
     """
@@ -56,6 +62,39 @@ def data_home() -> Path:
 
 def fleet_home(fleet: str) -> Path:
     return data_home() / "fleets" / fleet
+
+
+def id_slug(worker_id: str) -> str:
+    """A worker id as a path component and container-name part (`alice/box1` → `alice_box1`)."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", worker_id)
+
+
+def worker_home(fleet: str, worker_id: str) -> Path:
+    """The state one worker process owns; see `data_home`."""
+    return fleet_home(fleet) / "workers" / id_slug(worker_id)
+
+
+class AlreadyRunning(Exception):
+    pass
+
+
+def hold_lock(path: Path, what: str):
+    """Takes an exclusive lock on `path` for as long as the returned file stays open (the process
+    lifetime, in practice), or raises AlreadyRunning naming the holder's pid."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.seek(0)
+        holder = f.read().strip() or "unknown"
+        f.close()
+        raise AlreadyRunning(f"{what} is already running on this host (pid {holder})") from None
+    f.seek(0)
+    f.truncate()
+    f.write(f"{os.getpid()}\n")
+    f.flush()
+    return f
 
 
 @dataclass

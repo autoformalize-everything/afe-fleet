@@ -5,7 +5,7 @@
 The worker, not the agent, decides the outcome and does every push, PR and review. The agent
 gets model credentials and the workspace, nothing else.
 
-A journal (`journal-<slot>.json`) is written before each side effect, so a worker that dies
+A journal (`workers/<worker-id>/slot-<n>/journal.json`) is written before each side effect, so a worker that dies
 mid-attempt releases its lease on restart instead of waiting for the TTL.
 """
 
@@ -25,7 +25,7 @@ from pathlib import Path
 from . import agentchoice
 from .agent import Runtime, Verify, Workspace, run_agent, run_verify
 from .agentchoice import AgentChoice
-from .config import HostConfig, Loaded, fleet_home
+from .config import HostConfig, Loaded, fleet_home, id_slug, worker_home
 from .configrepo import TaskDef
 from .coord import Coord, Fenced, GitCoord, Lease, ServerCoord, Unreachable, Want
 from .forge import Forge, ForgeError
@@ -93,7 +93,7 @@ class Journal:
 
 class Worker:
     def __init__(self, loaded: Loaded, host: HostConfig, coord: Coord, forge: Forge, *, slot: int = 0,
-                 state_dir: Path | None = None):
+                 state_dir: Path | None = None, slot_dir: Path | None = None):
         self.loaded = loaded
         self.fleet = loaded.fleet
         self.host = host
@@ -101,9 +101,17 @@ class Worker:
         self.forge = forge
         self.slot = slot
         self.worker_id = host.worker_id if host.slots == 1 and slot == 0 else f"{host.worker_id}-{slot}"
-        self.state = (state_dir or fleet_home(self.fleet.name))
+        self.state = (state_dir or fleet_home(self.fleet.name))  # the fleet's: attempts are unique per lease
         self.state.mkdir(parents=True, exist_ok=True)
-        self.journal = Journal(self.state / f"journal-{slot}.json")
+        # this worker's own (the CLI holds its lock): crash journal, mirrors
+        self.slot_dir = slot_dir or (worker_home(self.fleet.name, host.worker_id) if state_dir is None
+                                     else self.state / "workers" / id_slug(host.worker_id)) / f"slot-{slot}"
+        self.slot_dir.mkdir(parents=True, exist_ok=True)
+        self.journal = Journal(self.slot_dir / "journal.json")
+        legacy = self.state / f"journal-{slot}.json"  # before per-worker state: one worker per host
+        if legacy.exists() and not self.journal.path.exists():
+            os.replace(legacy, self.journal.path)
+            log.info("adopted the journal of an older version of this worker: %s", legacy)
         self.stop = threading.Event()
         self.idle = 30.0
         self.infra_failures = 0
@@ -269,7 +277,9 @@ class Worker:
                                   agentchoice.DEFAULTS).for_cli(a.cli)
 
     def _runtime(self, td: TaskDef, wt) -> Runtime:
-        return Runtime(self.host.agent, td.project.get("image"), f"afe-fleet-{self.fleet.name}-{self.slot}",
+        # one container name per worker and slot: another worker's stray cleanup must not hit ours
+        name = f"afe-fleet-{self.fleet.name}-{id_slug(self.host.worker_id)}-{self.slot}"
+        return Runtime(self.host.agent, td.project.get("image"), name,
                        self.fleet.name, identity=(wt.git.name, wt.git.email), prepare=td.project.get("prepare"))
 
     def _write_task_files(self, ws: Workspace, lease: Lease, td: TaskDef, rev: str, kind: str) -> None:

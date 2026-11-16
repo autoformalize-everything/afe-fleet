@@ -240,7 +240,7 @@ A stronger version would make the claim itself carry `spec` and reject a mismatc
 
 **Selection** is random within a priority order: review, fix after "changes", continue a partial, new work. Random choice makes collisions rare; CAS makes them harmless.
 
-**Attempt journal.** `~/.local/share/afe-fleet/fleets/<fleet>/journal-<slot>.json`, written atomically before each side effect:
+**Attempt journal.** `~/.local/share/afe-fleet/fleets/<fleet>/workers/<worker-id>/slot-<n>/journal.json`, written atomically before each side effect. Per-process state lives under the worker id, which a lock held for the process lifetime makes unique on the host, so several worker processes (with different `--id`s) share one home; their slots also get their own lock- and config-repo mirrors and container names:
 `claimed → prepared → agent_started(session_id) → agent_finished → pushed(sha) → pr(number) → reported`.
 On start the worker reads it and asks the backend whether the lease is still its own (same worker, epoch and nonce).
 

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import __version__, service, update
 from .capacity import SpareCapacity
-from .config import HostConfig, Loaded, fleet_home, load, source_store
+from .config import AlreadyRunning, HostConfig, Loaded, fleet_home, hold_lock, load, worker_home
 from .configrepo import ConfigRepo
 from .gitutil import repo_url
 
@@ -50,29 +50,25 @@ def _forge(args):
     return GhForge()
 
 
-def _slot_config(loaded: Loaded, slot: int) -> ConfigRepo:
-    """Each slot gets its own object store: concurrent fetches into one repo collide."""
-    url = loaded.config.url
-    return ConfigRepo(url, source_store(url).with_name(source_store(url).stem + f"-{slot}.git"))
-
-
-def _coord(loaded: Loaded, who: str, slot: int):
+def _coord(loaded: Loaded, who: str, slot_dir: Path):
+    """A slot's coordination, over its own config- and lock-repo mirrors (`slot_dir`): concurrent
+    fetches into one repository collide."""
     from .coord import GitCoord, ServerCoord
     from .lockrepo import LockRepo
-    cfg = _slot_config(loaded, slot)
+    cfg = ConfigRepo(loaded.config.url, slot_dir / "config.git")
     fleet = loaded.fleet
     if fleet.mode == "github":
-        lock = LockRepo(repo_url(fleet.lock_repo), fleet_home(fleet.name) / f"lock-{slot}.git", who=who)
+        lock = LockRepo(repo_url(fleet.lock_repo), slot_dir / "lock.git", who=who)
         return GitCoord(lock, cfg), cfg
     return ServerCoord(fleet.url, cfg), cfg
 
 
-def _admin_coord(loaded: Loaded):
+def _admin_coord(loaded: Loaded, store: str = "lock.git"):
     from .coord import GitAdmin, ServerAdmin, ServerCoord
     from .lockrepo import LockRepo
     fleet = loaded.fleet
     if fleet.mode == "github":
-        lock = LockRepo(repo_url(fleet.lock_repo), fleet_home(fleet.name) / "lock-admin.git", who="admin")
+        lock = LockRepo(repo_url(fleet.lock_repo), fleet_home(fleet.name) / "admin" / store, who="admin")
         return GitAdmin(lock, loaded.config)
     return ServerAdmin(ServerCoord(fleet.url, loaded.config))
 
@@ -95,6 +91,12 @@ def cmd_worker(args) -> int:
     if host.gh_user is None:
         login = forge.login()
         host = host_config(login) if args.id is None and login else replace(host, gh_user=login)
+    home = worker_home(loaded.fleet.name, host.worker_id)
+    try:
+        held = hold_lock(home / "lock", f"worker {host.worker_id} of fleet {loaded.fleet.name}")  # noqa: F841
+    except AlreadyRunning as e:
+        log.error("%s; give each worker process on a host its own --id (or [worker] id)", e)
+        return 75
     log.info("afe-fleet %s worker %s for fleet %s (%s mode, %d slot%s)", __version__, host.worker_id,
              loaded.fleet.name, loaded.fleet.mode, host.slots, "" if host.slots == 1 else "s")
     update_lock = threading.Lock()
@@ -128,8 +130,8 @@ def cmd_worker(args) -> int:
                  "window", host.agent.cli, host.spare_capacity, host.spare_ease_in, host.spare_allowance)
 
     def make(slot: int) -> Worker:
-        coord, cfg = _coord(loaded, host.worker_id, slot)
-        w = Worker(replace(loaded, config=cfg), host, coord, forge, slot=slot)
+        coord, cfg = _coord(loaded, host.worker_id, home / f"slot-{slot}")
+        w = Worker(replace(loaded, config=cfg), host, coord, forge, slot=slot, slot_dir=home / f"slot-{slot}")
         w.maintain = maintain
         w.capacity = capacity
         if args.once:
@@ -154,12 +156,19 @@ def _service_args(args) -> list[str]:
 def cmd_admin(args) -> int:
     from .admin import Admin
     loaded = load(args.source)
-    adm = Admin(loaded, _admin_coord(loaded), _forge(args))
-    log.info("afe-fleet %s admin for fleet %s (%s mode)", __version__, loaded.fleet.name, loaded.fleet.mode)
-    if args.action == "cancel":
+    if args.action == "cancel":  # a one-off beside a running admin: its own mirror
+        adm = Admin(loaded, _admin_coord(loaded, "cancel.git"), _forge(args))
         for a in adm.cancel(args.task, reason=args.reason, remove=args.remove):
             print(a)
         return 0
+    try:
+        held = hold_lock(fleet_home(loaded.fleet.name) / "admin" / "lock",  # noqa: F841
+                         f"the admin of fleet {loaded.fleet.name}")
+    except AlreadyRunning as e:
+        log.error("%s", e)
+        return 75
+    adm = Admin(loaded, _admin_coord(loaded), _forge(args))
+    log.info("afe-fleet %s admin for fleet %s (%s mode)", __version__, loaded.fleet.name, loaded.fleet.mode)
     if args.once:
         for a in adm.sweep():
             print(a)
