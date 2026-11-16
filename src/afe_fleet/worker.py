@@ -12,6 +12,7 @@ mid-attempt releases its lease on restart instead of waiting for the TTL.
 from __future__ import annotations
 
 import fnmatch
+import gzip
 import json
 import logging
 import os
@@ -115,6 +116,35 @@ def out_of_scope(git, base_ref: str, patterns: list[str]) -> list[str]:
     for line in git.run("status", "--porcelain", "--untracked-files=all").stdout.splitlines():
         names.add(line[3:].split(" -> ")[-1].strip('"'))
     return sorted(n for n in names if n and not any(fnmatch.fnmatchcase(n, pat) for pat in patterns))
+
+
+def archive_attempt(ws: Workspace, task_logs: Path, name: str) -> Path | None:
+    """Keeps what an attempt leaves for later reading, before its directory goes:
+    `<task_logs>/<UTC time>-<name>/` with the agent's transcript (its JSONL output), the task
+    files it was given, what it wrote in `out/`, and Codex's own session files. JSON Lines are
+    gzipped. Never raises: losing a log must not lose the attempt."""
+    dest = task_logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{name}"
+    try:
+        files = [(ws.transcript, "transcript.jsonl")]
+        for sub in ("task", "out"):
+            files += [(p, f"{sub}/{p.relative_to(ws.root / sub)}") for p in sorted((ws.root / sub).rglob("*"))]
+        sessions = ws.root / "codex-home" / "sessions"
+        files += [(p, f"codex-sessions/{p.relative_to(sessions)}") for p in sorted(sessions.rglob("*"))]
+        files = [(src, rel) for src, rel in files if src.is_file()]
+        if not files:
+            return None
+        for src, rel in files:
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if src.suffix == ".jsonl":
+                with src.open("rb") as fin, gzip.open(target.with_name(target.name + ".gz"), "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+            else:
+                shutil.copyfile(src, target)
+        return dest
+    except OSError as e:
+        log.warning("could not archive the attempt's logs to %s: %s", dest, e)
+        return None
 
 
 def slug(task: str) -> str:
@@ -281,6 +311,8 @@ class Worker:
             hb.join(5)
             if lease.extra.get("worktree") is not None:
                 repo.remove(lease.extra["worktree"])
+            archive_attempt(ws, self.state / "logs" / slug(lease.task),
+                            f"e{lease.epoch}-{lease.kind}-{id_slug(self.worker_id)}")
             shutil.rmtree(ws.root, ignore_errors=True)
 
     def _local_name(self, lease: Lease) -> str:

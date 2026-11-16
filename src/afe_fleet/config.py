@@ -48,6 +48,8 @@ def data_home() -> Path:
             slot-<n>/{journal.json,lock.git,config.git}   crash journal, lock- and config-repo mirrors
           fleets/<fleet>/admin/{lock,lock.git}         the admin's (one per fleet on a host)
           fleets/<fleet>/attempts/<task>-e<epoch>/{work,task,out}   worktree per attempt
+          fleets/<fleet>/logs/<task>/<time>-e<epoch>-<kind>-<worker>/   what each attempt left:
+                                             transcript, task files, out/, Codex sessions
           fleets/<fleet>/server.sqlite       server mode
 
     Any number of worker processes, with different worker ids, share one home: per-process state

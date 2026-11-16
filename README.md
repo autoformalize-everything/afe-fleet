@@ -28,6 +28,8 @@ repos/<repo>-<hash>.git            code repositories, cloned once per machine an
                                    worker slot and process
 mirrors/                           config-repo mirrors
 fleets/<fleet>/attempts/<task>-e<epoch>/work   a git worktree per attempt
+fleets/<fleet>/logs/<task>/<time>-e<epoch>-<kind>-<worker>/   each attempt's transcript (gzipped
+                                   JSON Lines), task files, result, Codex sessions; kept, never pruned
 fleets/<fleet>/workers/<worker-id>/     one worker process's journal and mirrors, per slot
 fleets/<fleet>/admin/, server.sqlite
 ```
