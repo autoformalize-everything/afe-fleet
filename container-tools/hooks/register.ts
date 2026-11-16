@@ -72,12 +72,7 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const cfg = await loadConfig($, options)
     if (!CONTAINED.has(e.tool)) {
-      if (allowed(cfg).has(e.tool)) {
-        // hooks.json's PreToolUse backstop refuses every tool unless this is set,
-        // so a module that failed to load leaves nothing running on the host.
-        await $.env.set('CONTAINER_TOOLS_ACTIVE', '1')
-        return next(e)
-      }
+      if (allowed(cfg).has(e.tool)) return next(e)
       return { deny: `${e.tool} is not available here: this session's tools run inside container ${cfg.container}.` }
     }
     const refused = await permit($, cfg, e)

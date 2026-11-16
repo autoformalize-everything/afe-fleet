@@ -70,11 +70,11 @@ are not supported.
 - **Read**: text with offset/limit (line numbers added by Claude Code), images (≤ 3.75 MB) and
   PDFs (whole, ≤ 20 MB). Binary files are refused. **Edit/Write/NotebookEdit** follow Claude
   Code's rules (read first, unchanged since read, unique match unless `replace_all`).
-- **Failing closed.** Each hook has a `.catch` that refuses the call, so an error never falls
-  through to Claude Code's host implementation. In addition, `hooks.json` holds a classic
-  `PreToolUse` hook that refuses every tool unless the module has set `CONTAINER_TOOLS_ACTIVE=1`,
-  so a module that fails to load leaves the agent with no working tools rather than host ones.
-  (Don't export that variable yourself.)
+- **Failing closed.** `tool.call` refuses any tool outside the set, and each hook has a `.catch`
+  that refuses the call, so an error never falls through to Claude Code's host implementation.
+  This holds only while the module is loaded: if it fails to load, the session has Claude
+  Code's ordinary host tools. Check that the plugin loaded, for example with the `tools` list in
+  `-p --output-format stream-json`'s init message.
 
 ## Limits
 
