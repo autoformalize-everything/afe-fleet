@@ -2,8 +2,8 @@
 and the config defaults."""
 
 import json
-import os
 import sys
+import tomllib
 import threading
 from pathlib import Path
 
@@ -79,11 +79,12 @@ def test_container_wiring(tmp_path):
     env = rt.codex_env(ws)
     home = Path(env["CODEX_HOME"])
     assert home.parent == ws.root and (home / "auth.json").is_symlink()
-    toml = (home / "environments.toml").read_text()
-    assert "include_local = false" in toml and str(home / "exec-server.sh") in toml
-    script = (home / "exec-server.sh").read_text()
-    assert f"docker exec -i -w {ws.work} afe-fleet-f-0 {EXEC_SERVER_IN_CONTAINER} --listen stdio" in script
-    assert os.access(home / "exec-server.sh", os.X_OK)
+    toml = tomllib.loads((home / "environments.toml").read_text())
+    assert toml["include_local"] is False and toml["default"] == "container"
+    (box,) = toml["environments"]
+    assert box["id"] == "container" and box["program"].endswith("docker")
+    assert box["args"] == ["exec", "-i", "-w", str(ws.work), "afe-fleet-f-0", EXEC_SERVER_IN_CONTAINER,
+                           "--listen", "stdio"]
     args = rt._container_args(ws, rt.name)
     assert f"{server}:{EXEC_SERVER_IN_CONTAINER}:ro" in args
 

@@ -181,11 +181,13 @@ opened, and there is no fallback to the host. Codex's own sandbox (bubblewrap) c
 container, so it is off there (`-s danger-full-access`); the container is the sandbox. Codex's
 session files live in that per-attempt home and are removed with the attempt.
 
-Why a per-attempt `CODEX_HOME` (a workaround, as of Codex 0.167): a stdio exec-server can only be
-named in `$CODEX_HOME/environments.toml` (`program = …`), which has no path override and no `-c`
-equivalent. The one setting outside it, `CODEX_EXEC_SERVER_URL`, takes only `ws://`/`wss://` and
-carries no auth token, so it would need container networking and an unauthenticated port. If
-Codex gains a CLI flag for a stdio executor, `Runtime.codex_env` is the one place to change.
+Why a per-attempt `CODEX_HOME` (a workaround, as of Codex 0.167): a stdio exec-server
+(`program`/`args`) can only be named in `$CODEX_HOME/environments.toml`, which has no path
+override and no `-c` equivalent (`codex-rs/exec-server/src/environment_toml.rs`). The settings
+outside it take only a WebSocket URL: `CODEX_EXEC_SERVER_URL` with no auth at all (a token in the
+URL is ignored), and the app-server's `environment/add` with a bearer token sent only over
+`wss://` or loopback. Either would need container networking and an open port. If Codex gains a
+CLI flag for a stdio executor, `Runtime.codex_env` is the one place to change.
 
 ### Models and effort
 

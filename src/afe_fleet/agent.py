@@ -26,8 +26,8 @@ the prompt on stdin, later turns as `codex exec resume <thread> -`; after each c
 same verify/repair loop. In the container runtime Codex keeps its login and sessions on this
 machine but executes everything (commands, file reads and patches) through `codex-exec-server`
 running inside the attempt's container: a per-attempt CODEX_HOME holds an environments.toml whose
-only environment spawns `docker exec -i <container> codex-exec-server --listen stdio`, so there is
-no listener and no host fallback. Codex's own sandbox (bubblewrap) cannot run in a container and
+only environment spawns `docker exec -i <container> codex-exec-server --listen stdio` (program and
+args), so there is no listener and no host fallback. Codex's own sandbox (bubblewrap) cannot run in a container and
 is off there (`-s danger-full-access`): the container is the sandbox.
 """
 
@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
 import shutil
 import signal
 import subprocess
@@ -207,9 +206,11 @@ class Runtime:
         attempt's CODEX_HOME: the login shared with yours (symlinks, so refreshes stay serialized
         on the same lock files), a copy of your config, and the container as the only environment.
 
-        A workaround (Codex 0.167): a stdio exec-server can only be named in
-        $CODEX_HOME/environments.toml, with no path override or -c key; CODEX_EXEC_SERVER_URL takes
-        only ws(s):// and no auth token, so it would need container networking and an open port."""
+        A workaround (Codex 0.167): a stdio exec-server (`program`/`args`) can only be named in
+        $CODEX_HOME/environments.toml (codex-rs/exec-server/src/environment_toml.rs), with no path
+        override or -c key. CODEX_EXEC_SERVER_URL and the app-server's environment/add take only a
+        WebSocket URL, the former with no auth at all, the latter's bearer token only over wss:// or
+        loopback; either would need container networking and an open port."""
         env = {**os.environ, "AFE_WORK": str(ws.work), "AFE_TASK": str(ws.task), "AFE_OUT": str(ws.out)}
         if self.cfg.runtime == "local":
             env.update(self.cfg.env)
@@ -227,13 +228,11 @@ class Runtime:
         for name in ("config.toml", "AGENTS.md"):
             if (mine / name).is_file() and not (home / name).exists():
                 shutil.copyfile(mine / name, home / name)
-        script = home / "exec-server.sh"
-        script.write_text("#!/bin/sh\nexec docker exec -i -w " + shlex.quote(str(ws.work)) + " "
-                          + shlex.quote(self.name) + f" {EXEC_SERVER_IN_CONTAINER} --listen stdio\n")
-        script.chmod(0o755)
+        docker = shutil.which("docker") or "docker"
+        args = ["exec", "-i", "-w", str(ws.work), self.name, EXEC_SERVER_IN_CONTAINER, "--listen", "stdio"]
         (home / "environments.toml").write_text(
             'default = "container"\ninclude_local = false\n\n[[environments]]\nid = "container"\n'
-            f"program = {json.dumps(str(script))}\n")
+            f"program = {json.dumps(docker)}\nargs = {json.dumps(args)}\n")
         env["CODEX_HOME"] = str(home)
         return env
 
