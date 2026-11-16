@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agentchoice import AgentChoice, cli_args
+from .capacity import CodexSessionTail, parse_claude_stream, parse_codex_session
 from .config import AgentConfig
 from .events import NOWHERE, Events
 
@@ -120,6 +121,7 @@ class Runtime:
         self.identity = identity  # (name, email) for the agent's commits in a container
         self.prepare = prepare  # project.toml `prepare`: run in the worktree before the agent
         self.events: Events = NOWHERE  # the attempt's event log (events.py)
+        self.usage = None  # capacity.Usage: what the agent's output says about the subscription
 
     def paths(self, ws: Workspace) -> dict[str, str]:
         """Where the agent sees the task files and writes its result, for the prompt."""
@@ -393,6 +395,20 @@ def codex_tool_events(ev: Events, msg: dict) -> None:
         ev.end("tool", id=item.get("id"), status=item.get("status"), exit=item.get("exit_code"))
 
 
+def _claude_tokens(u: object) -> dict | None:
+    if not isinstance(u, dict):
+        return None
+    return {"input": u.get("input_tokens"), "output": u.get("output_tokens"),
+            "cache_read": u.get("cache_read_input_tokens"), "cache_write": u.get("cache_creation_input_tokens")}
+
+
+def _codex_tokens(u: object) -> dict | None:
+    if not isinstance(u, dict):
+        return None
+    return {"input": u.get("input_tokens"), "output": u.get("output_tokens"),
+            "cache_read": u.get("cached_input_tokens"), "reasoning": u.get("reasoning_output_tokens")}
+
+
 def user_message(text: str) -> str:
     return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
 
@@ -440,8 +456,11 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
                 if msg.get("type") == "system" and msg.get("subtype") == "init":
                     run.session_id = msg.get("session_id") or run.session_id
                 claude_tool_events(ev, msg)
+                if msg.get("type") == "rate_limit_event" and rt.usage is not None:
+                    rt.usage.observe(parse_claude_stream(msg.get("rate_limit_info") or {}, time.time()), "stream")
                 if msg.get("type") == "result":
-                    ev.end("turn", cost=msg.get("total_cost_usd"), error=bool(msg.get("is_error")))
+                    ev.end("turn", cost=msg.get("total_cost_usd"), error=bool(msg.get("is_error")),
+                           tokens=_claude_tokens(msg.get("usage")))
                     with turn_done:
                         results.append(msg)
                         turn_done.notify_all()
@@ -531,6 +550,7 @@ class _Turn:
     stop: str | None = None  # "cancelled" | "stall" | "timeout" | "error": end the run
     wrap: bool = False  # the wall-clock limit passed mid-turn; the turn was interrupted
     error: str | None = None
+    usage: dict | None = None  # tokens, from turn.completed
 
 
 def _codex_turn(rt: Runtime, ws: Workspace, argv: list[str], env: dict[str, str], message: str,
@@ -564,6 +584,7 @@ def _codex_turn(rt: Runtime, ws: Workspace, argv: list[str], env: dict[str, str]
                     turn.session_id = msg.get("thread_id") or turn.session_id
                 elif kind == "turn.completed":
                     turn.completed = True
+                    turn.usage = msg.get("usage")
                 elif kind == "turn.failed":
                     turn.error = json.dumps(msg.get("error"))[:2000]
                 elif kind == "error":
@@ -576,9 +597,19 @@ def _codex_turn(rt: Runtime, ws: Workspace, argv: list[str], env: dict[str, str]
         proc.stdin.close()
     except (BrokenPipeError, OSError, ValueError):
         pass
+    tail = CodexSessionTail(env.get("CODEX_HOME")) if rt.usage is not None and rt.cfg.runtime == "container" else None
+    next_tail = 0.0
+
+    def follow_usage() -> None:
+        if tail is not None and (rl := tail.poll()):
+            rt.usage.observe(parse_codex_session(rl, time.time()), "stream")
+
     while proc.poll() is None or t.is_alive():
         t.join(1.0)
         now = time.monotonic()
+        if now >= next_tail:
+            follow_usage()
+            next_tail = now + 15
         if cancel.is_set():
             turn.stop = "cancelled"
         elif now - last_output[0] > cfg.stall:
@@ -593,6 +624,7 @@ def _codex_turn(rt: Runtime, ws: Workspace, argv: list[str], env: dict[str, str]
     if proc.poll() is None:
         _kill_group(proc)
     t.join(10)
+    follow_usage()
     turn.exit_code = proc.returncode
     return turn
 
@@ -621,7 +653,8 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
         while True:
             ev.begin("turn")
             turn = _codex_turn(rt, ws, rt.codex_argv(extra, run.session_id), env, message, cancel, start, wrapped)
-            ev.end("turn", completed=turn.completed, exit=turn.exit_code, stop=turn.stop)
+            ev.end("turn", completed=turn.completed, exit=turn.exit_code, stop=turn.stop,
+                   tokens=_codex_tokens(turn.usage))
             run.exit_code = turn.exit_code
             run.session_id = turn.session_id or run.session_id
             if turn.error:

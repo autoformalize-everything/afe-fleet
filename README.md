@@ -130,6 +130,7 @@ filters = ["zlib/*"]
 push = "fork"              # push work branches to your fork ("origin" if you can push upstream)
 # max_open_prs = 2          # start no new work while 2 of this worker's PRs await review or merging
 # spare_capacity = 1.0     # claim only with spare subscription capacity (below)
+# usage_warning = 0.1      # warn when a usage window has less than 10% left
 # spare_ease_in = 0.1      # ... with a head start after each window resets
 
 [agent]
@@ -157,8 +158,17 @@ afe-fleet timeline [--fleet afe] [--since 2026-11-17T09:00Z] [-o trace.json]
 ```
 
 prints where the time went (each worker's busy and idle time by reason, time per phase, the
-slowest tools, every attempt) and writes a Chrome trace: open it in https://ui.perfetto.dev or
-`chrome://tracing` for one row per worker slot. `--events DIR` reads logs copied from other
+slowest tools, tokens and cost, the latest usage, every attempt) and writes a Chrome trace:
+open it in https://ui.perfetto.dev or `chrome://tracing` for one row per worker slot, and a
+counter track per agent CLI with the subscription's usage per window over time.
+
+**Usage.** The worker records the agent's subscription usage as `usage` events: from the agent's
+own output while it works (Claude's `rate_limit_event` lines; the `token_count` events in the
+session files Codex writes, followed during the attempt), and by asking the CLI, without a model
+request, when a worker idles and its last reading is ten minutes old. The spare-capacity check
+reads the same record and asks only when it is older than five minutes. A window with less than
+`usage_warning` of its limit left (`[worker]`, default 0.1; `--usage-warning`) is logged as a
+warning, once per window and reset. `--events DIR` reads logs copied from other
 hosts. Each attempt's transcripts are kept beside it, in `fleets/<fleet>/logs/`.
 
 ### Fewer review rounds

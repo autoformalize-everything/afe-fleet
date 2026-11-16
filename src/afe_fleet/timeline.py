@@ -109,6 +109,14 @@ def chrome_trace(all_spans: list[Span], instants: list[dict]) -> dict:
                    "ts": round(s.start * 1e6), "dur": max(1, round(s.dur * 1e6)),
                    "args": {**s.args, **({"open": True} if s.open else {})}})
     for e in instants:
+        if e.get("span") == "usage":
+            # a counter track per agent CLI, one line per window: % of the limit used
+            vals = {w["name"]: round(100 * w["used"], 1) if w.get("used") is not None else 100.0
+                    for w in e.get("windows") or [] if isinstance(w, dict) and w.get("name")}
+            if vals:
+                ev.append({"ph": "C", "name": f"{e.get('cli', 'agent')} usage %", "pid": 1,
+                           "ts": round(e["t"] * 1e6), "args": vals})
+            continue
         ev.append({"ph": "i", "s": "t", "name": e.get("text") or e.get("span"), "cat": e.get("span"), "pid": 1,
                    "tid": tid[e.get("w", "?")], "ts": round(e["t"] * 1e6),
                    "args": {k: v for k, v in e.items() if k not in ("t", "w", "ph")}})
@@ -122,7 +130,7 @@ def _fmt(sec: float) -> str:
     return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
 
 
-def summary(all_spans: list[Span]) -> str:
+def summary(all_spans: list[Span], instants: list[dict] | None = None) -> str:
     lines = []
     by_w: dict[str, list[Span]] = defaultdict(list)
     for s in all_spans:
@@ -159,6 +167,31 @@ def summary(all_spans: list[Span]) -> str:
             lines.append(f"  {name:20} {_fmt(sum(agg[name])):>8} in {len(agg[name])} calls")
         for s in sorted(tools, key=lambda s: -s.dur)[:8]:
             lines.append(f"  {_fmt(s.dur):>8}  {s.w}  {label(s)}")
+    turns = [s for s in all_spans if s.name == "turn"]
+    if any(s.args.get("tokens") or s.args.get("cost") for s in turns):
+        lines.append("\nTokens and cost (agent turns):")
+        tot: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for s in turns:
+            for k, v in (s.args.get("tokens") or {}).items():
+                tot[s.w][k] += v or 0
+            tot[s.w]["cost"] += s.args.get("cost") or 0
+        for w, t in sorted(tot.items()):
+            toks = ", ".join(f"{k} {int(v):,}" for k, v in t.items() if k != "cost" and v)
+            cost = f", ${t['cost']:.2f}" if t["cost"] else ""
+            lines.append(f"  {w}: {toks}{cost}")
+    usage = [e for e in instants or [] if e.get("span") == "usage" and e.get("windows")]
+    if usage:
+        latest: dict[tuple[str, str], tuple[float, float | None]] = {}
+        for e in usage:
+            for w in e["windows"]:
+                latest[(e.get("cli", "?"), w["name"])] = (e["t"], w.get("used"))
+        lines.append("\nUsage (latest reading):")
+        for (cli, name), (t, used) in sorted(latest.items()):
+            pct = "spent" if used is None else f"{100 * used:.0f}%"
+            lines.append(f"  {cli} {name} {pct} at {time.strftime('%H:%M:%S', time.gmtime(t))}")
+        warnings = [e for e in instants or [] if e.get("span") == "usage-warning"]
+        if warnings:
+            lines.append(f"  {len(warnings)} low-usage warning(s)")
     attempts = [s for s in all_spans if s.name == "attempt"]
     if attempts:
         lines.append("\nAttempts:")

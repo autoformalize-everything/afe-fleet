@@ -205,6 +205,8 @@ class HostConfig:
     spare_allowance: float = 0.0
     # start no new work while this many of the worker's own PRs await review or merging (coord.Want)
     max_open_prs: int | None = None
+    # warn when a subscription window has less than this fraction of its limit left; 0: never
+    usage_warning: float = 0.1
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     @staticmethod
@@ -246,7 +248,9 @@ class HostConfig:
             spare_allowance=_fraction(_first(overrides.get("spare_allowance"), w.get("spare_allowance")),
                                       f"{path}: [worker] spare_allowance"),
             max_open_prs=_count(_first(overrides.get("max_open_prs"), w.get("max_open_prs")),
-                                f"{path}: [worker] max_open_prs"))
+                                f"{path}: [worker] max_open_prs"),
+            usage_warning=_fraction(_first(overrides.get("usage_warning"), w.get("usage_warning"), 0.1),
+                                    f"{path}: [worker] usage_warning"))
         if agent.runtime not in ("container", "docker", "local"):
             raise ValueError(f"{path}: [agent] runtime must be local, container or docker")
         if agent.cli == "codex" and agent.runtime == "docker":

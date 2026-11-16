@@ -34,6 +34,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class Window:
     name: str
     used: float  # fraction of the limit spent
     elapsed: float  # fraction of the window passed, 0..1
+    resets: float | None = None  # when the window resets (seconds since the epoch), if known
 
     def budget(self, limit: float, ease_in: float = 0.0, allowance: float = 0.0) -> float:
         """The fraction of the limit this window may have used by now."""
@@ -93,7 +95,7 @@ def parse_claude(report: dict, now: float) -> list[Window]:
             resets = datetime.fromisoformat(str(lim["resets_at"])).timestamp()
         except ValueError:
             raise UsageUnknown(f"{name}: bad resets_at {lim['resets_at']!r}") from None
-        out.append(Window(name, used, _elapsed(resets, length, now)))
+        out.append(Window(name, used, _elapsed(resets, length, now), resets))
     return out
 
 
@@ -121,13 +123,84 @@ def parse_codex(result: dict, now: float) -> list[Window]:
             continue
         if mins <= 0:
             raise UsageUnknown(f"{name}: window of {mins} minutes")
-        out.append(Window(name, used, _elapsed(_number(w["resetsAt"], f"{key} resetsAt"), mins * 60, now)))
+        resets = _number(w["resetsAt"], f"{key} resetsAt")
+        out.append(Window(name, used, _elapsed(resets, mins * 60, now), resets))
     if not out:
         raise UsageUnknown("the Codex usage report has no windows")
     return out
 
 
 PARSERS = {"claude": parse_claude, "codex": parse_codex}
+
+
+def parse_claude_stream(info: dict, now: float) -> list[Window]:
+    """The windows in a `rate_limit_event` of Claude Code's stream-json output (`rate_limit_info`):
+    `unifiedWindows` by name, utilization 0..1, named as `/usage` names them (`five_hour` is
+    `session`, `seven_day` is `weekly_all`, `seven_day_<model>` is `weekly_scoped (<model>)`), so
+    the two sources make one series. A window whose status is not `allowed` is spent."""
+    out = []
+    for raw, w in (info.get("unifiedWindows") or {}).items():
+        length = 5 * 3600 if raw.startswith("five_hour") else 7 * 86400 if raw.startswith("seven_day") else None
+        name = {"five_hour": "session", "seven_day": "weekly_all"}.get(
+            raw, f"weekly_scoped ({raw.removeprefix('seven_day_')})" if raw.startswith("seven_day_") else raw)
+        if not isinstance(w, dict) or length is None:
+            continue
+        status = str(w.get("status") or "allowed")
+        try:
+            used = _number(w.get("utilization"), f"{name} utilization")
+            resets = _number(w.get("resetsAt"), f"{name} resetsAt")
+        except UsageUnknown:
+            continue
+        spent = not status.startswith("allowed")
+        out.append(Window(name, math.inf if spent else used, _elapsed(resets, length, now), resets))
+    return out
+
+
+def parse_codex_session(rl: dict, now: float) -> list[Window]:
+    """The windows in the `rate_limits` of a `token_count` event in a Codex session file (the same
+    numbers as the app-server's, in snake case)."""
+    return parse_codex({"rateLimits": {
+        "primary": rl.get("primary") and {"usedPercent": rl["primary"].get("used_percent"),
+                                          "windowDurationMins": rl["primary"].get("window_minutes"),
+                                          "resetsAt": rl["primary"].get("resets_at")},
+        "secondary": rl.get("secondary") and {"usedPercent": rl["secondary"].get("used_percent"),
+                                              "windowDurationMins": rl["secondary"].get("window_minutes"),
+                                              "resetsAt": rl["secondary"].get("resets_at")},
+        "rateLimitReachedType": rl.get("rate_limit_reached_type")}}, now)
+
+
+class CodexSessionTail:
+    """Follows the session files Codex writes under a CODEX_HOME, for the rate limits its
+    `token_count` events carry; its --json output has none."""
+
+    def __init__(self, codex_home: str | None):
+        self.root = Path(codex_home) / "sessions" if codex_home else None
+        self.offsets: dict[Path, int] = {}
+
+    def poll(self) -> dict | None:
+        """The newest `rate_limits` written since the last poll, or None."""
+        latest = None
+        if self.root is None or not self.root.is_dir():
+            return None
+        for f in sorted(self.root.rglob("*.jsonl")):
+            try:
+                with f.open("rb") as fh:
+                    fh.seek(self.offsets.get(f, 0))
+                    data = fh.read()
+            except OSError:
+                continue
+            end = data.rfind(b"\n") + 1  # whole lines only
+            self.offsets[f] = self.offsets.get(f, 0) + end
+            for line in data[:end].splitlines():
+                if b"rate_limits" not in line:
+                    continue
+                try:
+                    payload = json.loads(line).get("payload") or {}
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if payload.get("type") == "token_count" and isinstance(payload.get("rate_limits"), dict):
+                    latest = payload["rate_limits"]
+        return latest
 
 
 def verdict(windows: list[Window], limit: float, ease_in: float = 0.0, allowance: float = 0.0) -> tuple[bool, str]:
@@ -228,18 +301,19 @@ def run_command(argv: list[str], timeout: float = 120) -> dict:
         raise UsageUnknown(f"{argv[0]} did not print JSON: {lines[-1][:200]!r}") from None
 
 
-class SpareCapacity:
-    """The spare-capacity check for one agent CLI, shared by a worker's slots; the usage reading
-    is cached for `ttl` seconds. `exe` is the CLI's executable; `command`, if given, a command that
-    prints the usage JSON instead."""
+class Usage:
+    """The latest usage of one agent CLI, shared by a process's slots: whatever saw it last, the
+    agent's own output during an attempt (`observe`) or a query of the CLI (`reading`, when the
+    last observation is older than asked). Every observation goes to the event log as a `usage`
+    event, and a window with less than `warn_below` of its limit left is logged as a warning once
+    per window and reset."""
 
-    def __init__(self, cli: str, limit: float, command: list[str] | None = None, *, exe: str | None = None,
-                 ease_in: float = 0.0, allowance: float = 0.0, ttl: float = 300,
-                 clock: Callable[[], float] = time.time, reader: Callable[[], dict] | None = None):
+    def __init__(self, cli: str, command: list[str] | None = None, *, exe: str | None = None,
+                 clock: Callable[[], float] = time.time, reader: Callable[[], dict] | None = None,
+                 events=None, warn_below: float = 0.0):
         if cli not in PARSERS:
             raise ValueError(f"no usage parser for agent CLI {cli!r}")
-        self.cli, self.limit, self.ttl, self.clock = cli, limit, ttl, clock
-        self.ease_in, self.allowance = ease_in, allowance
+        self.cli, self.clock, self.events, self.warn_below = cli, clock, events, warn_below
         if reader is not None:
             self.read = reader
         elif command:
@@ -247,19 +321,78 @@ class SpareCapacity:
         else:
             self.read = lambda: READERS[cli](exe or cli)
         self._lock = threading.Lock()
-        self._read_at: float | None = None
+        self._at: float | None = None
         self._windows: list[Window] | None = None
         self._error: str | None = None
+        self._warned: set[tuple] = set()
 
-    def check(self) -> tuple[bool, str]:
+    def observe(self, windows: list[Window], source: str) -> None:
+        if not windows:
+            return
+        with self._lock:
+            self._at, self._windows, self._error = self.clock(), windows, None
+        self._record(windows, source)
+
+    def reading(self, max_age: float) -> tuple[list[Window] | None, str | None]:
+        """The windows, queried when the last reading (failed ones included) is older than
+        `max_age` seconds; or None and why not."""
         with self._lock:
             now = self.clock()
-            if self._read_at is None or now - self._read_at >= self.ttl:
-                self._read_at = now
+            if self._at is None or now - self._at >= max_age:
+                self._at = now
                 try:
                     self._windows, self._error = PARSERS[self.cli](self.read(), now), None
                 except UsageUnknown as e:
                     self._windows, self._error = None, str(e)
-            if self._windows is None:
-                return False, f"usage unknown ({self._error})"
-            return verdict(self._windows, self.limit, self.ease_in, self.allowance)
+                    if self.events is not None:
+                        self.events.instant("usage", cli=self.cli, source="query", error=str(e))
+                    return None, self._error
+                fresh = self._windows
+            else:
+                return self._windows, self._error
+        self._record(fresh, "query")
+        return fresh, None
+
+    def _record(self, windows: list[Window], source: str) -> None:
+        if self.events is not None:
+            self.events.instant("usage", cli=self.cli, source=source, windows=[
+                {"name": w.name, "used": None if math.isinf(w.used) else round(w.used, 4),
+                 "elapsed": round(w.elapsed, 4), "resets": w.resets} for w in windows])
+        if self.warn_below <= 0:
+            return
+        for w in windows:
+            left = 1 - w.used
+            key = (w.name, round(w.resets or 0))
+            if left < self.warn_below and key not in self._warned:
+                self._warned.add(key)
+                when = f", resets in {_duration(w.resets - self.clock())}" if w.resets else ""
+                what = "is spent" if math.isinf(w.used) else f"has {max(left, 0):.0%} left ({w.used:.0%} used)"
+                log.warning("%s usage: the %s window %s%s", self.cli, w.name, what, when)
+                if self.events is not None:
+                    self.events.instant("usage-warning", cli=self.cli, window=w.name,
+                                        used=None if math.isinf(w.used) else round(w.used, 4), resets=w.resets)
+
+
+def _duration(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 86400}d{sec % 86400 // 3600}h" if sec >= 86400 else f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+
+
+class SpareCapacity:
+    """The spare-capacity check for one agent CLI, over a shared `Usage`: a reading older than
+    `ttl` seconds is refreshed by a query. `exe` is the CLI's executable; `command`, if given, a
+    command that prints the usage JSON instead."""
+
+    def __init__(self, cli: str, limit: float, command: list[str] | None = None, *, exe: str | None = None,
+                 ease_in: float = 0.0, allowance: float = 0.0, ttl: float = 300,
+                 clock: Callable[[], float] = time.time, reader: Callable[[], dict] | None = None,
+                 usage: Usage | None = None):
+        self.cli, self.limit, self.ttl = cli, limit, ttl
+        self.ease_in, self.allowance = ease_in, allowance
+        self.usage = usage or Usage(cli, command, exe=exe, clock=clock, reader=reader)
+
+    def check(self) -> tuple[bool, str]:
+        windows, error = self.usage.reading(self.ttl)
+        if windows is None:
+            return False, f"usage unknown ({error})"
+        return verdict(windows, self.limit, self.ease_in, self.allowance)

@@ -197,6 +197,7 @@ class Worker:
         self.infra_failures = 0
         self.maintain = None  # called before every claim: config reload, self-update, ...
         self.capacity = None  # capacity.SpareCapacity: claim only with spare subscription capacity
+        self.usage = None  # capacity.Usage: the agent CLI's subscription usage, shared by the slots
         self._spare: bool | None = None
         self.events_log: EventLog | None = None  # the process's event log (events.py); None: none
         self.idle_reason = "no-task"
@@ -227,6 +228,11 @@ class Worker:
             if did:
                 self.idle = 30.0
             else:
+                if self.usage is not None:  # keep the usage record going while idle (a query at most every 10 min)
+                    try:
+                        self.usage.reading(600)
+                    except Exception:  # noqa: BLE001 - never let recording stop the loop
+                        log.exception("reading usage")
                 with self.ev.span("idle", reason=self.idle_reason, planned=self.idle):
                     self.stop.wait(self.idle)
                 self.idle = min(self.idle * 2, 900)
@@ -445,7 +451,7 @@ class Worker:
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease))
 
         rt = self._runtime(td, wt)
-        rt.events = ev
+        rt.events, rt.usage = ev, self.usage
         verify_cmd = td.meta.get("verify", proj.get("verify"))  # task.toml overrides project.toml
         paths = td.meta.get("paths", proj.get("paths"))  # what the task may change; None: anything
 
@@ -595,7 +601,7 @@ class Worker:
         lease.extra["worktree"] = wt
         self._write_task_files(ws, lease, td, rev, "review")
         rt = self._runtime(td, wt)
-        rt.events = ev
+        rt.events, rt.usage = ev, self.usage
         base, approved = proj.get("base", "main"), pr.get("approved_sha")
         scoped = ""
         if approved and approved != sha and wt.git.run("merge-base", "--is-ancestor", approved, sha).returncode == 0:

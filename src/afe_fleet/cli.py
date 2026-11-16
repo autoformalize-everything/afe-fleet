@@ -26,7 +26,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, service, update
-from .capacity import SpareCapacity
+from .capacity import SpareCapacity, Usage
 from .config import AlreadyRunning, HostConfig, Loaded, fleet_home, hold_lock, load, worker_home
 from .events import EventLog
 from .configrepo import ConfigRepo
@@ -87,7 +87,7 @@ def cmd_worker(args) -> int:
                                kinds=args.kinds.split(",") if args.kinds else None, filters=args.filter,
                                model=args.model, effort=args.effort, spare_capacity=args.spare_capacity,
                                spare_ease_in=args.spare_ease_in, spare_allowance=args.spare_allowance,
-                               max_open_prs=args.max_open_prs)
+                               max_open_prs=args.max_open_prs, usage_warning=args.usage_warning)
 
     host = host_config(gh_user)
     if host.gh_user is None:
@@ -123,20 +123,21 @@ def cmd_worker(args) -> int:
                 return False
             return True
 
+    events = EventLog(fleet_home(loaded.fleet.name) / "events", host.worker_id)
+    usage = Usage(host.agent.cli, host.agent.usage_command or None, exe=os.path.expanduser(host.agent.command[0]),
+                  events=events.bind(host.worker_id), warn_below=host.usage_warning)
     capacity = None
     if host.spare_capacity is not None:
-        capacity = SpareCapacity(host.agent.cli, host.spare_capacity, host.agent.usage_command or None,
-                                 exe=os.path.expanduser(host.agent.command[0]), ease_in=host.spare_ease_in,
-                                 allowance=host.spare_allowance)
+        capacity = SpareCapacity(host.agent.cli, host.spare_capacity, ease_in=host.spare_ease_in,
+                                 allowance=host.spare_allowance, usage=usage)
         log.info("claiming only with spare %s capacity: used < %g × elapsed + %g × (1 − elapsed) + %g in every "
                  "window", host.agent.cli, host.spare_capacity, host.spare_ease_in, host.spare_allowance)
-
-    events = EventLog(fleet_home(loaded.fleet.name) / "events", host.worker_id)
 
     def make(slot: int) -> Worker:
         coord, cfg = _coord(loaded, host.worker_id, home / f"slot-{slot}")
         w = Worker(replace(loaded, config=cfg), host, coord, forge, slot=slot, slot_dir=home / f"slot-{slot}")
         w.events_log = events
+        w.usage = usage
         w.maintain = maintain
         w.capacity = capacity
         if args.once:
@@ -231,7 +232,7 @@ def cmd_timeline(args) -> int:
     spans, instants = timeline.spans(events)
     out = Path(args.output)
     out.write_text(json.dumps(timeline.chrome_trace(spans, instants)))
-    print(timeline.summary(spans))
+    print(timeline.summary(spans, instants))
     print(f"\nTrace: {out} ({len(spans)} spans); open it in https://ui.perfetto.dev or chrome://tracing")
     return 0
 
@@ -308,6 +309,9 @@ def parser() -> argparse.ArgumentParser:
     wr.add_argument("--max-open-prs", type=int, metavar="N",
                     help="start no new work while N of this worker's own PRs await review or merging "
                          "(reviews and work on an existing PR continue)")
+    wr.add_argument("--usage-warning", type=float, metavar="FRACTION",
+                    help="warn when a subscription window has less than this fraction of its limit left "
+                         "(default 0.1; 0: never)")
     wr.add_argument("--once", action="store_true", help="one claim and attempt, then exit")
 
     a = sub.add_parser("admin", help="run the admin").add_subparsers(dest="action", required=True)
