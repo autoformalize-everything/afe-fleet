@@ -234,12 +234,13 @@ class Admin:
             return []
         reviewed = (v.status.last or {}).get("reviewed_sha")
         if reviewed and info["head_sha"] != reviewed:
-            if self._write(v, Rework(), {"outcome": "rework", "reason": "PR head moved after approval"}):
+            if self._write(v, Rework(), {"outcome": "rework", "reason": "PR head moved after approval",
+                                         "approved_sha": reviewed}):
                 return [f"{task}: head moved after approval; rework"]
             return []
         if info["checks"] == "failure" or info.get("mergeable") is False:
             reason = "CI failed" if info["checks"] == "failure" else "merge conflict"
-            if self._write(v, Rework(), {"outcome": "rework", "reason": reason}):
+            if self._write(v, Rework(), {"outcome": "rework", "reason": reason, "approved_sha": reviewed}):
                 return [f"{task}: {reason}; rework"]
             return []
         if info["checks"] in ("pending", "none") or info.get("mergeable") is None:
@@ -247,7 +248,8 @@ class Admin:
             if first is None or first[0] != info["head_sha"]:
                 self.t.ci[task] = (info["head_sha"], self.clock())
             elif self.clock() - first[1] > self.fleet.ci_timeout:
-                if self._write(v, Rework(), {"outcome": "rework", "reason": "CI timed out"}):
+                if self._write(v, Rework(), {"outcome": "rework", "reason": "CI timed out",
+                                             "approved_sha": reviewed}):
                     self.t.ci.pop(task, None)
                     return [f"{task}: CI timed out; rework"]
             if info["checks"] == "pending" or info.get("mergeable") is None:

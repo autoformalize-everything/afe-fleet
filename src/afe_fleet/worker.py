@@ -11,11 +11,13 @@ mid-attempt releases its lease on restart instead of waiting for the TTL.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
 import re
 import secrets
+import shlex
 import shutil
 import threading
 import time
@@ -42,16 +44,50 @@ The task description is in {task_dir}/TASK.md and machine-readable context in
 {task_dir}/task.json (previous attempts, review feedback, the PR so far). The repository is
 checked out in the current directory, a git worktree on its own branch.
 
-Do the task. Commit your work with clear messages as you go. When you are done, write
-{out_dir}/result.json:
+Do the task. Commit your work with clear messages as you go. When you are done, write the file
+{out_dir}/result.json (this exact path: it is outside the repository, and no result file
+belongs in the repository):
 
     {{"outcome": "success" | "partial" | "failure",
       "summary": "<what you did>",
       "progress": "<what is left, if anything>",
       "debug": "<why it failed or what blocked you, if anything>"}}
 
+Before you finish, do what the reviewer will do, because everything they find costs another
+round:{checks}
+- Read `git status` and `git diff --stat origin/{base}...HEAD`: every changed file must be one
+  the task allows{scope}, and nothing may be left untracked.
+- Re-read each claim you make about existing code against that code, and each reference you
+  give (file and line) at that place.
+- In the summary, say what you checked and quote the result.
+
 Do not push and do not open pull requests; that is done for you.
-{extra}"""
+{notes}{extra}"""
+
+MERGED_NOTE = """
+`origin/{base}` had moved since this pull request was last worked on; it has been merged into
+this branch for you (the last commit), without conflicts. Make sure the checks still pass.
+"""
+
+CONFLICT_NOTE = """
+`origin/{base}` has moved and this branch conflicts with it. A merge of `origin/{base}` is in
+progress in the worktree, with conflicts in:
+
+{files}
+
+Resolve each conflict so that both sides' intent survives, `git add` the file, and conclude with
+`git commit --no-edit`. For a file this task does not own, take the version from
+`origin/{base}` (`git checkout --theirs -- <file>`). Do not redo or restructure the work: if
+task.json shows nothing else outstanding, the merge and the checks are the whole job.
+"""
+
+APPROVED_NOTE = """
+Commit {approved} of this pull request was already reviewed and approved. Review what changed
+since then, `git diff {approved} {sha}`. A merge of `origin/{base}` in that range brings in the
+base's own changes, which are not under review: check that the merge is right and that the
+pull request's content survived it. Do not review the approved part again, unless the new
+changes break it.
+"""
 
 REVIEW_PROMPT = """You are reviewing the pull request for task `{task}`.
 
@@ -60,12 +96,25 @@ history. The PR head ({sha}) is checked out in the current directory; it is base
 `origin/{base}`.
 
 Review whether the change does what the task asks, correctly and completely. Do not modify the
-repository. Write {out_dir}/review.json:
+repository. Ask for changes only for what is wrong or missing by the task's own terms, all of it
+in this one review, with the fix you expect; preferences that the task and the project's rules
+do not require belong in the summary, not in a request for changes.{scoped}
+Write {out_dir}/review.json:
 
     {{"verdict": "approve" | "changes",
       "summary": "<the review, for the author>",
       "comments": [{{"path": "...", "line": 1, "body": "..."}}]}}
 {extra}"""
+
+
+def out_of_scope(git, base_ref: str, patterns: list[str]) -> list[str]:
+    """The files this branch changes (committed since it left `base_ref`, staged, modified or
+    untracked) that match none of the glob `patterns` (`*` crosses directories)."""
+    mb = git.run("merge-base", base_ref, "HEAD").stdout.strip() or base_ref
+    names = set(git.run("diff", "--name-only", mb, "HEAD").stdout.splitlines())
+    for line in git.run("status", "--porcelain", "--untracked-files=all").stdout.splitlines():
+        names.add(line[3:].split(" -> ")[-1].strip('"'))
+    return sorted(n for n in names if n and not any(fnmatch.fnmatchcase(n, pat) for pat in patterns))
 
 
 def slug(task: str) -> str:
@@ -315,17 +364,44 @@ class Worker:
         lease.extra["worktree"] = wt
         git = wt.git
         start_sha = git("rev-parse", "HEAD")
+        base_ref = f"refs/remotes/origin/{base}"
+        notes = ""
+        if start != base_ref and git.run("merge-base", "--is-ancestor", base_ref, "HEAD").returncode != 0:
+            # The base moved under an existing PR: merge it before the agent starts, so only a
+            # real conflict costs the agent anything.
+            if git.run("merge", "--no-edit", base_ref).returncode == 0:
+                notes = MERGED_NOTE.format(base=base)
+            else:
+                files = git.run("diff", "--name-only", "--diff-filter=U").stdout.split()
+                notes = CONFLICT_NOTE.format(base=base, files="\n".join(f"    {f}" for f in files))
+                log.info("%s: origin/%s conflicts in %s", lease.task, base, ", ".join(files))
         self._write_task_files(ws, lease, td, rev, "work")
         self.journal.write(step="prepared", task=lease.task, epoch=lease.epoch, kind="work",
                            nonce=lease.status.lease.get("nonce"), token=self._token(lease))
 
         rt = self._runtime(td, wt)
         verify_cmd = td.meta.get("verify", proj.get("verify"))  # task.toml overrides project.toml
-        prompt = WORK_PROMPT.format(task=lease.task, extra=proj.get("prompt", ""), **rt.paths(ws))
+        paths = td.meta.get("paths", proj.get("paths"))  # what the task may change; None: anything
+
+        def check() -> Verify:
+            """The verify command, then the task's scope."""
+            v = run_verify(rt, ws, verify_cmd, self.host.agent.max_wall)
+            bad = out_of_scope(git, base_ref, paths) if paths else []
+            if not bad:
+                return v
+            return Verify(False, (f"{v.log}\n\n" if not v.ok else "")
+                          + f"This task may change only: {', '.join(paths)}. These files are outside that; undo "
+                          f"the changes to them (`git checkout origin/{base} -- FILE`, or `git rm` a file the "
+                          "branch added), and keep result files out of the repository:\n" + "\n".join(bad))
+
+        prompt = WORK_PROMPT.format(
+            task=lease.task, extra=proj.get("prompt", ""), base=base, notes=notes,
+            checks=f"\n- Run `{shlex.join(verify_cmd)}` and fix what it reports: it decides whether the attempt counts."
+            if verify_cmd else "",
+            scope=f" ({', '.join(paths)})" if paths else "", **rt.paths(ws))
         choice = self._choice(td, "work")
         log.info("%s: running the agent (%s)", lease.task, choice.describe())
-        run = run_agent(rt, ws, prompt, cancel=cancel, choice=choice,
-                        verify=lambda: run_verify(rt, ws, verify_cmd, self.host.agent.max_wall))
+        run = run_agent(rt, ws, prompt, cancel=cancel, choice=choice, verify=check)
         if lease.extra.get("fenced"):
             raise Fenced(f"{lease.task}: lease lost during the attempt")
         shutdown = bool(lease.extra.get("shutdown"))
@@ -338,7 +414,9 @@ class Worker:
         changed = head != start_sha
         result = self._read_json(ws.out / "result.json")
         # the in-loop verify ran on this tree already, unless the agent never finished a turn
-        verify = run.verify if run.verify is not None else run_verify(rt, ws, verify_cmd, self.host.agent.max_wall)
+        verify = run.verify if run.verify is not None else check()
+        if verify.ok and paths and (bad := out_of_scope(git, base_ref, paths)):  # the sweep above added files
+            verify = Verify(False, "changed outside the task's scope: " + ", ".join(bad))
         if shutdown:
             log.info("%s: worker shutting down; reporting what exists", lease.task)
         infra = run.reason == "error" or shutdown or (run.turns == 0 and not changed)
@@ -394,6 +472,12 @@ class Worker:
             raise GitError(["pr", branch], 1, str(e)) from e
         pr = {**pr, "head_sha": head, "spec": td.spec, "gh_user": self.host.gh_user, "branch": branch,
               "fetch": pr.get("fetch") or push_url}
+        # What a reviewer approved before this rework, so that the next review covers only what
+        # changed since (admin: `approved_sha` on a rework after approval; carried while it holds).
+        approved = (lease.status.last or {}).get("approved_sha") or (prev or {}).get("approved_sha") \
+            if isinstance(prev, dict) else None
+        if approved and git.run("merge-base", "--is-ancestor", approved, head).returncode == 0:
+            pr["approved_sha"] = approved
         try:
             if reuse:
                 self.forge.comment(pr, f"Attempt {lease.epoch} by `{self.worker_id}` ({choice.describe()}) pushed "
@@ -433,7 +517,11 @@ class Worker:
         lease.extra["worktree"] = wt
         self._write_task_files(ws, lease, td, rev, "review")
         rt = self._runtime(td, wt)
-        prompt = REVIEW_PROMPT.format(task=lease.task, sha=sha, base=proj.get("base", "main"),
+        base, approved = proj.get("base", "main"), pr.get("approved_sha")
+        scoped = ""
+        if approved and approved != sha and wt.git.run("merge-base", "--is-ancestor", approved, sha).returncode == 0:
+            scoped = APPROVED_NOTE.format(approved=approved, sha=sha, base=base)
+        prompt = REVIEW_PROMPT.format(task=lease.task, sha=sha, base=base, scoped=scoped,
                                       extra=proj.get("review_prompt", ""), **rt.paths(ws))
         choice = self._choice(td, "review")
         log.info("%s: reviewing (%s)", lease.task, choice.describe())

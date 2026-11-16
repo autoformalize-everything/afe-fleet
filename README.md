@@ -84,10 +84,10 @@ The config repo:
 
 ```
 fleet.toml
-tasks/<project>/project.toml      repo, base, image, verify, prepare (nearest one above a task applies)
+tasks/<project>/project.toml      repo, base, image, verify, prepare, paths (nearest one above a task applies)
 tasks/<task-id>/TASK.md           the task; a task is a directory with TASK.md and none below it
 tasks/<task-id>/task.toml         optional: deps = [...], kinds = ["work", "review"], priority,
-                                  verify = [...], [agent] model/effort
+                                  verify = [...], paths = [...], [agent] model/effort
 done/<task-id>.json               written by the admin
 cancelled/<task-id>.json          written by the admin
 ```
@@ -140,6 +140,28 @@ repairs = 2
 # model = "opus-5.5"       # host default when the task and project say nothing
 # effort = "high"
 ```
+
+### Fewer review rounds
+
+Each "changes requested" costs an attempt and another review, so the worker removes the
+avoidable causes:
+
+- **Scope.** `paths = ["src/part/*", "tests/part.txt"]` in `task.toml` (or `project.toml`) lists
+  what a task may change, as globs on repository paths (`*` crosses directories). After the
+  verify command the worker checks every file the branch changed, committed or not, against it;
+  anything else fails the attempt's verify with the list, like a failed test, so the agent gets
+  to undo it before a reviewer has to ask.
+- **Self-review.** The work prompt names the verify command and has the agent do the reviewer's
+  checks itself before finishing: run verify, read its own diff against the scope, re-read what
+  it cites. The result file's path is given as an absolute path outside the repository.
+- **The base, merged first.** When work resumes on an existing pull request whose base has moved,
+  the worker merges `origin/<base>` before the agent starts. A clean merge costs the agent
+  nothing; a conflict is left in progress, with a prompt that asks for a minimal resolution and
+  nothing else.
+- **Reviews of what changed.** When a pull request is sent back after an approval (merge conflict,
+  CI), the approved commit travels with it, and the next reviewer is told to review only
+  `git diff <approved> <head>`. Reviewers are also told to ask for everything in one review and
+  only for what the task and the project's rules require.
 
 ### Reviews before new work
 

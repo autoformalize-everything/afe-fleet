@@ -59,8 +59,8 @@ EXEC_SERVER_IN_CONTAINER = "/opt/afe-fleet/codex-exec-server"
 # The attempt's container only has to stay up: the tools exec into it.
 KEEPALIVE = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
 
-WRAP_UP = ("Time is almost up. Commit what you have now, write /out/result.json (or "
-           "/out/review.json) describing what is done and what is not, and stop.")
+WRAP_UP = ("Time is almost up. Commit what you have now, write {out_dir}/result.json (or "
+           "{out_dir}/review.json) describing what is done and what is not, and stop.")
 
 
 @dataclass
@@ -449,7 +449,7 @@ def run_agent(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
             if not wrapped and now - start > cfg.max_wall:
                 wrapped = True
                 if not proc.stdin.closed:
-                    send(WRAP_UP)
+                    send(WRAP_UP.format(**rt.paths(ws)))
     finally:
         if proc.poll() is None:
             if run.reason == "exit":  # stdin closed; give it a moment to exit by itself
@@ -579,7 +579,7 @@ def run_codex(rt: Runtime, ws: Workspace, prompt: str, *, verify: Callable[[], V
                 if run.session_id is None:
                     run.reason = "timeout"
                     break
-                message = WRAP_UP
+                message = WRAP_UP.format(**rt.paths(ws))
                 continue
             if not turn.completed:  # exited without finishing the turn
                 break

@@ -320,6 +320,8 @@ Because the checkpoint is pushed before the heartbeat, a host that dies loses at
 
 **Work across workers.** A continuation by the same GitHub user pushes to the same PR branch with `--force-with-lease=<branch>:<observed head>`. A different user branches from the previous head, opens a new PR, and the report replaces `pr`; the admin closes the superseded one.
 
+**Fewer rounds.** A task's `paths` (globs) are checked after verify against everything the branch changed, and a file outside them fails verify like a test. Resuming work on a PR whose base moved, the worker merges `origin/<base>` first; only a conflict reaches the agent, as a merge in progress with a prompt for a minimal resolution. A rework that follows an approval carries `approved_sha` (in the admin's rework record, then in the PR record while it is an ancestor of the head), and the next review is scoped to `approved_sha..head`.
+
 **Review.** Claim a `review` task, check out `pr.head_sha` read-only, run the agent with the review prompt, post one PR review bound to that SHA, then `submit(review verdict)` carrying `reviewed_sha`. "Changes requested" is the comment on the PR plus the task returning to `work`; the next author gets the review as input. Work outside the task's scope goes in `followups[]`, which the admin files as new tasks.
 
 **Shutdown.** On SIGTERM: interrupt the agent, checkpoint, report `partial` (reason `worker-shutdown`). The lease is released immediately instead of waiting for the TTL.
