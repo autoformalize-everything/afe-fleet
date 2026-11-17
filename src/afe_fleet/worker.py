@@ -64,6 +64,12 @@ round:{checks}
 - In the summary, say what you checked and quote the result.
 
 Do not push and do not open pull requests; that is done for you.
+
+Your time is limited, so keep each exploratory command short: a check that runs for more than a
+minute or two should be made smaller, not rerun with a longer timeout. Checks that need large
+inputs or many cases belong in the project's own tests, where they are built and run the way
+the project says (an interpreter or a debug build can be far slower than the real thing).
+Scratch files go outside the repository.
 {notes}{extra}"""
 
 MERGED_NOTE = """
@@ -101,6 +107,13 @@ Review whether the change does what the task asks, correctly and completely. Do 
 repository. Ask for changes only for what is wrong or missing by the task's own terms, all of it
 in this one review, with the fix you expect; preferences that the task and the project's rules
 do not require belong in the summary, not in a request for changes.{scoped}
+
+Your time is limited, so keep each exploratory command short: a check that runs for more than a
+minute or two should be made smaller, not rerun with a longer timeout. If a property needs large
+inputs or many cases to check, run the project's own tests the way the project says (an
+interpreter or a debug build can be far slower than the real thing), or ask for such a test.
+Scratch files go outside the repository.
+
 Write {out_dir}/review.json:
 
     {{"verdict": "approve" | "changes",
