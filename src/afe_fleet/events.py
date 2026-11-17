@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -36,9 +37,10 @@ log = logging.getLogger(__name__)
 class EventLog:
     """One process's event files; safe to share between its threads."""
 
-    def __init__(self, directory: Path | None, who: str):
+    def __init__(self, directory: Path | None, who: str, owner: tuple[int, int] | None = None):
         self.directory = directory
         self.who = who
+        self.owner = owner  # (uid, gid) to give new files and directories, for a process run by sudo
         self._lock = threading.Lock()
         self._warned = False
 
@@ -50,9 +52,18 @@ class EventLog:
         name = "".join(c if c.isalnum() or c in "._-" else "_" for c in self.who)
         try:
             with self._lock:
+                path = self.directory / f"{name}-{day}.jsonl"
+                new = not path.exists()
+                if new and self.owner:  # each directory made here goes to the owner too
+                    missing = [d for d in (self.directory, *self.directory.parents) if not d.exists()]
+                    for d in reversed(missing):
+                        d.mkdir(exist_ok=True)
+                        os.chown(d, *self.owner)
                 self.directory.mkdir(parents=True, exist_ok=True)
-                with open(self.directory / f"{name}-{day}.jsonl", "a") as f:
+                with open(path, "a") as f:
                     f.write(line)
+                if new and self.owner:
+                    os.chown(path, *self.owner)
         except OSError as e:
             if not self._warned:
                 self._warned = True

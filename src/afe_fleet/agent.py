@@ -257,7 +257,7 @@ class Runtime:
         if self.cfg.runtime == "container":
             argv = ["docker", "run", "-d", *self._container_args(ws, self.name), "--entrypoint", "/bin/sh",
                     self.image, "-c", KEEPALIVE]
-            with self.events.span("container-start", image=self.image):
+            with self.events.span("container-start", image=self.image, container=self.name):
                 _run_or_raise("docker run", argv, None, 900)
         if self.prepare:
             if not (isinstance(self.prepare, list) and all(isinstance(a, str) for a in self.prepare)):

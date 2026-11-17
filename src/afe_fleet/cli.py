@@ -213,19 +213,38 @@ def cmd_server(args) -> int:
 
 # -- timeline ----------------------------------------------------------------------------------
 
+def _events_dir(args, *, need_events: bool) -> Path:
+    from .config import data_home
+    if args.events:
+        return Path(args.events)
+    fleets = sorted(p.name for p in (data_home() / "fleets").glob("*")
+                    if (p / "events").is_dir() or (not need_events and p.is_dir()))
+    name = args.fleet or (fleets[0] if len(fleets) == 1 else None)
+    if name is None:
+        raise ValueError(f"name the fleet with --fleet (fleets on this host: {', '.join(fleets) or 'none'})")
+    return fleet_home(name) / "events"
+
+
+def cmd_trace(args) -> int:
+    import pwd
+
+    from . import trace
+    owner = None
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+        # run by sudo: write to the invoking user's event log, as that user's files
+        owner = (int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", os.environ["SUDO_UID"])))
+        if not os.environ.get("AFE_FLEET_HOME"):
+            os.environ["HOME"] = pwd.getpwuid(owner[0]).pw_dir
+            os.environ.pop("XDG_DATA_HOME", None)
+    directory = _events_dir(args, need_events=False)
+    return trace.run(directory, bpftrace=args.bpftrace, duration=args.duration, owner=owner, prefix=args.prefix)
+
+
 def cmd_timeline(args) -> int:
     import json
 
     from . import timeline
-    from .config import data_home
-    if args.events:
-        directory = Path(args.events)
-    else:
-        fleets = sorted(p.name for p in (data_home() / "fleets").glob("*") if (p / "events").is_dir())
-        name = args.fleet or (fleets[0] if len(fleets) == 1 else None)
-        if name is None:
-            raise ValueError(f"name the fleet with --fleet (fleets with event logs: {', '.join(fleets) or 'none'})")
-        directory = fleet_home(name) / "events"
+    directory = _events_dir(args, need_events=True)
     events = timeline.read_events(directory, timeline.parse_time(args.since), timeline.parse_time(args.until))
     if not events:
         raise ValueError(f"no events in {directory}")
@@ -340,6 +359,14 @@ def parser() -> argparse.ArgumentParser:
     tl.add_argument("--until", help="up to this time")
     tl.add_argument("-o", "--output", default="afe-fleet-trace.json", help="where to write the Chrome trace")
 
+    tr = sub.add_parser("trace", help="record every process run in the fleet's containers into the event log "
+                                      "(bpftrace; run with sudo)")
+    tr.add_argument("--fleet", help="the fleet's name (default: the only fleet on this host)")
+    tr.add_argument("--events", help="an events directory to write to instead")
+    tr.add_argument("--duration", type=float, metavar="SECONDS", help="stop after this long (default: ctrl-c)")
+    tr.add_argument("--bpftrace", default="bpftrace", help="the bpftrace executable")
+    tr.add_argument("--prefix", default="afe-fleet-", help="trace the containers whose names start with this")
+
     sv = sub.add_parser("service", help="manage systemd user services").add_subparsers(dest="action", required=True)
     si = sv.add_parser("install", help="install, enable and start (idempotent)")
     si.add_argument("role", choices=service.ROLES)
@@ -363,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.verbose)
     try:
         return {"worker": cmd_worker, "admin": cmd_admin, "server": cmd_server, "status": cmd_status,
-                "timeline": cmd_timeline, "service": cmd_service}[args.cmd](args)
+                "timeline": cmd_timeline, "trace": cmd_trace, "service": cmd_service}[args.cmd](args)
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         log.error("%s", e)
         return 2

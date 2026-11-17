@@ -162,6 +162,13 @@ slowest tools, tokens and cost, the latest usage, every attempt) and writes a Ch
 open it in https://ui.perfetto.dev or `chrome://tracing` for one row per worker slot, and a
 counter track per agent CLI with the subscription's usage per window over time.
 
+**Processes.** `sudo $(command -v afe-fleet) trace` records every program run in the fleet's
+containers (`afe-fleet-*`) into the same event log, through bpftrace: when it started and ended,
+its command line, exit status or signal, and CPU time. It needs root (bpf) but writes the files
+as the user who ran sudo, under that user's data directory. `afe-fleet timeline` then shows each
+worker's processes, one track per process, under the worker's own row, and sums the time per
+program ("lake 41m wall, 2h10m CPU"). Run it beside the workers for as long as you want traced.
+
 **Usage.** The worker records the agent's subscription usage as `usage` events: from the agent's
 own output while it works (Claude's `rate_limit_event` lines; the `token_count` events in the
 session files Codex writes, followed during the attempt), and by asking the CLI, without a model

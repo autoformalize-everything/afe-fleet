@@ -10,6 +10,10 @@ carry their reason. The summary, on standard output, gives each worker's busy an
 
 A span still open at the end of the log (a running worker, or one that died) is drawn up to
 the worker's last event and marked `open`.
+
+With `sudo afe-fleet trace` running (trace.py), the log also has a `proc` span for every program
+run in the workers' containers. Each worker gets a group of tracks for them, one per process,
+beside its own row, and the summary adds the programs that took the most time.
 """
 
 from __future__ import annotations
@@ -78,11 +82,19 @@ def spans(events: Iterable[dict]) -> tuple[list[Span], list[dict]]:
                 done.append(Span(w, e["span"], b["t"], e["t"], args))
         elif e.get("ph") == "i":
             instants.append(e)
+        elif e.get("ph") == "X" and isinstance(e.get("dur"), (int, float)):  # complete: trace.py's processes
+            args = {k: v for k, v in e.items() if k not in ("t", "w", "ph", "span", "dur")}
+            done.append(Span(w, e.get("span", "?"), e["t"], e["t"] + e["dur"], args, open=bool(e.get("open"))))
     for (w, name, _), opened in stacks.items():  # still running, or the process died
         for b in opened:
             args = {k: v for k, v in b.items() if k not in ("t", "w", "ph", "span")}
             done.append(Span(w, name, b["t"], max(last_t.get(w, b["t"]), b["t"]), args, open=True))
     done.sort(key=lambda s: (s.start, -s.dur))
+    owners = {s.args["container"]: s.w for s in done if s.name == "container-start" and s.args.get("container")}
+    for s in done:  # a container's processes belong to the worker that started it
+        if s.name == "proc":
+            c = s.args.get("container", s.w)
+            s.w = owners.get(c) or owners.get(c.removesuffix("-verify")) or f"container {c}"
     return done, instants
 
 
@@ -96,15 +108,32 @@ def label(s: Span) -> str:
         return f"idle ({a.get('reason', '')})"
     if s.name == "turn":
         return "turn"
+    if s.name == "proc":
+        return (a.get("args") or a.get("cmd") or "?")[:120]
     return s.name
 
 
 def chrome_trace(all_spans: list[Span], instants: list[dict]) -> dict:
-    workers = sorted({s.w for s in all_spans} | {e.get("w", "?") for e in instants})
+    workers = sorted({s.w for s in all_spans if s.name != "proc"}
+                     | {e.get("w", "?") for e in instants if e.get("span") != "usage"})
     tid = {w: i + 1 for i, w in enumerate(workers)}
     ev = [{"ph": "M", "name": "process_name", "pid": 1, "args": {"name": "afe-fleet"}}]
     ev += [{"ph": "M", "name": "thread_name", "pid": 1, "tid": tid[w], "args": {"name": w}} for w in workers]
+    procs = sorted({s.w for s in all_spans if s.name == "proc"})
+    group = {w: i + 2 for i, w in enumerate(procs)}  # a trace "process" per worker, a track per OS process
+    ev += [{"ph": "M", "name": "process_name", "pid": group[w], "args": {"name": f"{w}: processes"}} for w in procs]
+    named: set[tuple[int, int]] = set()
     for s in all_spans:
+        if s.name == "proc":
+            key = (group[s.w], int(s.args.get("pid", 0)))
+            if key not in named:
+                named.add(key)
+                ev.append({"ph": "M", "name": "thread_name", "pid": key[0], "tid": key[1],
+                           "args": {"name": f"{Path(str(s.args.get('cmd', '?'))).name} [{key[1]}]"}})
+            ev.append({"ph": "X", "name": label(s), "cat": "proc", "pid": key[0], "tid": key[1],
+                       "ts": round(s.start * 1e6), "dur": max(1, round(s.dur * 1e6)),
+                       "args": {**s.args, **({"open": True} if s.open else {})}})
+            continue
         ev.append({"ph": "X", "name": label(s), "cat": s.name, "pid": 1, "tid": tid[s.w],
                    "ts": round(s.start * 1e6), "dur": max(1, round(s.dur * 1e6)),
                    "args": {**s.args, **({"open": True} if s.open else {})}})
@@ -134,8 +163,10 @@ def summary(all_spans: list[Span], instants: list[dict] | None = None) -> str:
     lines = []
     by_w: dict[str, list[Span]] = defaultdict(list)
     for s in all_spans:
-        by_w[s.w].append(s)
-    lines.append("Workers (wall time from first to last event):")
+        if s.name != "proc":
+            by_w[s.w].append(s)
+    if by_w:
+        lines.append("Workers (wall time from first to last event):")
     for w, ss in sorted(by_w.items()):
         wall = max(s.end for s in ss) - min(s.start for s in ss)
         busy = sum(s.dur for s in ss if s.name in ("attempt", "sweep"))
@@ -167,6 +198,21 @@ def summary(all_spans: list[Span], instants: list[dict] | None = None) -> str:
             lines.append(f"  {name:20} {_fmt(sum(agg[name])):>8} in {len(agg[name])} calls")
         for s in sorted(tools, key=lambda s: -s.dur)[:8]:
             lines.append(f"  {_fmt(s.dur):>8}  {s.w}  {label(s)}")
+    procs = [s for s in all_spans if s.name == "proc" and not str(s.args.get("cmd", "")).startswith("fork of ")]
+    if procs:
+        lines.append("\nPrograms in the containers (wall total, CPU total, runs, slowest run):")
+        agg_p: dict[str, list[Span]] = defaultdict(list)
+        for s in procs:
+            agg_p[Path(str(s.args.get("cmd", "?"))).name].append(s)
+        for name in sorted(agg_p, key=lambda n: -sum(s.dur for s in agg_p[n]))[:12]:
+            ss = agg_p[name]
+            cpu = sum(s.args.get("cpu") or 0 for s in ss)
+            lines.append(f"  {name:20} {_fmt(sum(s.dur for s in ss)):>8} {_fmt(cpu):>8} {len(ss):6}  "
+                         f"{_fmt(max(s.dur for s in ss)):>8}")
+        failed = [s for s in procs if s.args.get("exit") not in (None, 0) or s.args.get("signal")]
+        lines.append(f"  {len(procs)} program runs, {len(failed)} failed or killed; the slowest:")
+        for s in sorted(procs, key=lambda s: -s.dur)[:6]:
+            lines.append(f"  {_fmt(s.dur):>8}  {s.w}  {label(s)[:90]}")
     turns = [s for s in all_spans if s.name == "turn"]
     if any(s.args.get("tokens") or s.args.get("cost") for s in turns):
         lines.append("\nTokens and cost (agent turns):")
