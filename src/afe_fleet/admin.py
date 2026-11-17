@@ -33,7 +33,7 @@ from .config import Loaded
 from .configrepo import ConfigRepo, Tree, record_path
 from .coord import AdminCoord, AdminView, GitAdmin, ServerAdmin
 from .events import NOWHERE
-from .forge import Forge, ForgeError
+from .forge import Forge, ForgeError, pr_key
 from .gitutil import github_slug
 from .model import TERMINAL, Accept, Cancel, Expire, Need, Rework
 from .status import now_iso
@@ -97,6 +97,7 @@ class Admin:
         if isinstance(self.coord, GitAdmin) and views and not tree.tasks:
             log.error("the task tree is empty but %d lock branches exist; refusing to act", len(views))
             return acts
+        self._pr_info = self._pr_states(views)
         for task, v in sorted(views.items()):
             try:
                 acts += self._task(tree, v)
@@ -119,6 +120,20 @@ class Admin:
         for a in acts:
             log.info("%s", a)
         return acts
+
+    def _pr_states(self, views) -> dict:
+        """The state of every PR in review or awaiting merge, in one request per repository;
+        empty if that fails (each PR is then asked for on its own)."""
+        prs = [v.status.core.pr for v in views.values()
+               if v.status.core.need in (Need.REVIEW, Need.MERGE) and isinstance(v.status.core.pr, dict)
+               and v.status.core.pr.get("repo") and v.status.core.pr.get("number")]
+        if not prs:
+            return {}
+        try:
+            return self.forge.pr_states(prs)
+        except (ForgeError, ValueError, KeyError) as e:
+            log.warning("PR states in one request: %s; asking for each", e)
+            return {}
 
     def _write(self, v: AdminView, ev, last: dict) -> bool:
         ok = self.coord.write(v, ev, {**last, "by": "admin"})
@@ -228,7 +243,7 @@ class Admin:
 
     def _pr(self, v: AdminView, pr: dict) -> list[str]:
         task, core = v.task, v.status.core
-        info = self.forge.pr_state(pr)
+        info = getattr(self, "_pr_info", {}).pop(pr_key(pr), None) or self.forge.pr_state(pr)
         if info["state"] == "merged":
             if self._write(v, Accept(), {"outcome": "accepted", "merged_sha": info.get("merge_sha")}):
                 return [f"{task}: PR merged; accepted"]

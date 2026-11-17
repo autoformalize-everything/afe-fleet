@@ -24,6 +24,32 @@ class ForgeError(Exception):
     pass
 
 
+def pr_key(pr: dict) -> tuple[str, int]:
+    return pr["repo"], int(pr["number"])
+
+
+FAILED = ("failure", "cancelled", "timed_out", "action_required", "startup_failure")
+
+
+def checks_state(conclusions: list[str | None], statuses: list[str]) -> str:
+    """The checks of a commit as one word: check runs' conclusions (None while running) and
+    commit statuses' states, all lower case."""
+    if any(c in FAILED for c in conclusions) or any(s in ("failure", "error") for s in statuses):
+        return "failure"
+    if any(c is None for c in conclusions) or any(s in ("pending", "expected") for s in statuses):
+        return "pending"
+    return "success" if conclusions or statuses else "none"
+
+
+PR_STATES_QUERY = """
+query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { %s } }
+fragment F on PullRequest {
+  state mergeable headRefOid mergeCommit { oid }
+  commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+    __typename ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }
+}"""
+
+
 class Forge:
     def login(self) -> str | None: ...
 
@@ -40,6 +66,11 @@ class Forge:
         """{"state": open|closed|merged, "head_sha", "mergeable": bool|None,
             "checks": success|failure|pending|none, "merge_sha"}"""
         ...
+
+    def pr_states(self, prs: list[dict]) -> dict[tuple[str, int], dict]:
+        """`pr_state` of many PRs at once, by (repo, number). A forge that can should answer in
+        one request per repository; this default asks for each."""
+        return {pr_key(pr): self.pr_state(pr) for pr in prs}
 
     def merge(self, pr: dict, sha: str) -> bool: ...
 
@@ -72,9 +103,25 @@ class Forge:
     def invite(self, repo: str, user: str) -> int: ...
 
 
+def graphql_pr_state(p: dict) -> dict:
+    """`pr_state`'s answer from the GraphQL fragment in PR_STATES_QUERY."""
+    nodes = ((p.get("commits") or {}).get("nodes") or [{}])
+    rollup = ((nodes[-1] or {}).get("commit") or {}).get("statusCheckRollup") or {}
+    ctx = (rollup.get("contexts") or {}).get("nodes") or []
+    conclusions = [(c.get("conclusion") or None) and c["conclusion"].lower() for c in ctx if c.get("__typename") == "CheckRun"]
+    statuses = [str(c.get("state", "")).lower() for c in ctx if c.get("__typename") == "StatusContext"]
+    state = {"OPEN": "open", "CLOSED": "closed", "MERGED": "merged"}.get(p.get("state"), "open")
+    return {"state": state, "head_sha": p.get("headRefOid"),
+            "mergeable": {"MERGEABLE": True, "CONFLICTING": False}.get(p.get("mergeable")),
+            "checks": checks_state(conclusions, statuses),
+            "merge_sha": (p.get("mergeCommit") or {}).get("oid") if state == "merged" else None}
+
+
 class GhForge(Forge):
     def __init__(self, gh: str = "gh"):
         self.gh = gh
+        # GET path -> (ETag, body): an unchanged resource answers 304, which costs no rate limit
+        self._etags: dict[str, tuple[str, Any]] = {}
 
     def _run(self, *args: str, input: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
         p = subprocess.run([self.gh, *args], input=input, capture_output=True, text=True, timeout=120)
@@ -85,17 +132,30 @@ class GhForge(Forge):
     def api(self, path: str, *, method: str = "GET", body: dict | None = None,
             check: bool = True) -> tuple[int, Any]:
         args = ["api", "-i", "-X", method, path]
+        cached = self._etags.get(path) if method == "GET" else None
+        if cached:
+            args += ["-H", f"If-None-Match: {cached[0]}"]
         if body is not None:
             args += ["--input", "-"]
         p = self._run(*args, input=json.dumps(body) if body is not None else None, check=False)
         head, _, rest = p.stdout.partition("\r\n\r\n")
-        if not rest:
+        if not rest and "\r\n\r\n" not in p.stdout:
             head, _, rest = p.stdout.partition("\n\n")
         try:
             code = int(head.split()[1])
         except (IndexError, ValueError):
             raise ForgeError(f"gh api {path}: {p.stderr.strip()[-300:]}") from None
+        if code == 304 and cached:
+            return 200, cached[1]
         data = json.loads(rest) if rest.strip() else None
+        if method == "GET" and code == 200:
+            etag = next((line.split(":", 1)[1].strip() for line in head.splitlines()
+                         if line.lower().startswith("etag:")), None)
+            if etag:
+                self._etags.pop(path, None)
+                self._etags[path] = (etag, data)
+                while len(self._etags) > 512:  # oldest first
+                    self._etags.pop(next(iter(self._etags)))
         if check and code >= 400:
             raise ForgeError(f"gh api {method} {path}: {code} {data}")
         return code, data
@@ -141,18 +201,31 @@ class GhForge(Forge):
         _, runs = self.api(f"repos/{pr['repo']}/commits/{sha}/check-runs?per_page=100")
         conclusions = [r.get("conclusion") for r in runs.get("check_runs", [])]
         _, combined = self.api(f"repos/{pr['repo']}/commits/{sha}/status")
-        legacy = combined.get("state") if combined.get("total_count") else None
-        if any(c in ("failure", "cancelled", "timed_out", "action_required") for c in conclusions) \
-                or legacy in ("failure", "error"):
-            checks = "failure"
-        elif any(c is None for c in conclusions) or legacy == "pending":
-            checks = "pending"
-        elif conclusions or legacy == "success":
-            checks = "success"
-        else:
-            checks = "none"
-        return {"state": state, "head_sha": sha, "mergeable": p.get("mergeable"), "checks": checks,
+        statuses = [s.get("state") for s in combined.get("statuses", [])]
+        return {"state": state, "head_sha": sha, "mergeable": p.get("mergeable"),
+                "checks": checks_state(conclusions, statuses),
                 "merge_sha": p.get("merge_commit_sha") if p.get("merged") else None}
+
+    def pr_states(self, prs: list[dict]) -> dict[tuple[str, int], dict]:
+        """One GraphQL request per repository (up to 50 PRs each) instead of three REST calls
+        per PR."""
+        by_repo: dict[str, set[int]] = {}
+        for pr in prs:
+            by_repo.setdefault(pr["repo"], set()).add(int(pr["number"]))
+        out = {}
+        for repo, numbers in by_repo.items():
+            owner, name = repo.split("/", 1)
+            nums = sorted(numbers)
+            for i in range(0, len(nums), 50):
+                chunk = nums[i:i + 50]
+                fields = " ".join(f"p{n}: pullRequest(number: {n}) {{ ...F }}" for n in chunk)
+                p = self._run("api", "graphql", "-f", f"query={PR_STATES_QUERY % fields}",
+                              "-f", f"owner={owner}", "-f", f"name={name}")
+                data = (json.loads(p.stdout).get("data") or {}).get("repository") or {}
+                for n in chunk:
+                    if data.get(f"p{n}"):
+                        out[(repo, n)] = graphql_pr_state(data[f"p{n}"])
+        return out
 
     def merge(self, pr: dict, sha: str) -> bool:
         code, _ = self.api(f"repos/{pr['repo']}/pulls/{pr['number']}/merge", method="PUT", check=False,

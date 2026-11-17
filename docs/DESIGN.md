@@ -137,6 +137,7 @@ changes(since)             -> events after a cursor
 | Storage | Lock branch `task-lock/<task-id>` in the lock repo; its tree is exactly one file, `status.json`; each commit's message is a title for people (naming the PR as `owner/repo#N` on reports, reviews and acceptances) and a last line of JSON with the event, which the audit replays | `tasks(id, rev, status)` and `events(seq, task, rev, event, at)` in SQLite |
 | `rev` | Tip commit SHA | Integer |
 | `snapshot()` | `git fetch lock '+refs/heads/task-lock/*:refs/remotes/lock/*'`, then `git cat-file --batch`. One round trip, incremental, not counted against the REST rate limit. | `GET /tasks` |
+| PR states (admin) | One GraphQL request per repository per sweep for every PR in review or awaiting merge (state, mergeability, head, check rollup), instead of three REST calls per PR; other REST reads send the last `ETag`, and an unchanged answer (304) costs no rate limit. | the same |
 | `submit` | Build a commit with parent = `rev` using plumbing (`hash-object`, `mktree`, `commit-tree`), then `git push --force-with-lease=<ref>:<rev> lock <commit>:<ref>`, where `<ref>` is `refs/heads/task-lock/<task-id>` | See endpoints below; the server runs `step` inside one transaction |
 | `Lost` | Push rejected (stale info, non-fast-forward, "reference already exists") | HTTP 409 with the current status |
 | `changes()` | `git ls-remote lock 'refs/heads/task-lock/*'` every 20 s, diff against the last map, walk `old..new` on changed lock branches. Each commit is one event, so nothing is missed after downtime. | `GET /admin/events?after=<seq>` (long-poll) |
@@ -213,7 +214,7 @@ loop:
                    candidates = in the tree ∧ unleased ∧ need ∈ my kinds ∧ claimable ∧ deps done ∧ filter ∧ cooldown over
   submit(claim)    CAS against the lock tip the decision was made on; records spec_rev and spec
                    if the claim created the branch: fetch the config repo again; done record → stop (section 4)
-                   Lost → pick another immediately; nothing claimable → idle backoff 30 s … 15 min
+                   Lost → pick another immediately; nothing claimable → idle backoff 30 s … 2 min
   run attempt      journal, workspace, heartbeat thread, agent supervisor
   finish           verify → push → PR or review → submit(report) → cleanup
 ```

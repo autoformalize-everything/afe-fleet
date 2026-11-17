@@ -40,6 +40,10 @@ from .status import UnknownVersion, now_iso
 
 log = logging.getLogger(__name__)
 
+# An idle worker looks for work again after 30 s, doubling up to this. Looking is cheap (two git
+# fetches), and a task freed by a dependency or a review should not wait long for a worker.
+MAX_IDLE = 120.0
+
 WORK_PROMPT = """You are working on task `{task}`.
 
 The task description is in {task_dir}/TASK.md and machine-readable context in
@@ -250,7 +254,7 @@ class Worker:
                         log.exception("reading usage")
                 with self.ev.span("idle", reason=self.idle_reason, planned=self.idle):
                     self.stop.wait(self.idle)
-                self.idle = min(self.idle * 2, 900)
+                self.idle = min(self.idle * 2, MAX_IDLE)
 
     def want(self) -> Want:
         base = self.host.worker_id  # the limit is the process's, across its slots
