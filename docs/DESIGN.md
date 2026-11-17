@@ -133,7 +133,7 @@ changes(since)             -> events after a cursor
 
 | | GitHub | Server |
 |---|---|---|
-| Storage | Lock branch `task-lock/<task-id>` in the lock repo; its tree is exactly one file, `status.json` | `tasks(id, rev, status)` and `events(seq, task, rev, event, at)` in SQLite |
+| Storage | Lock branch `task-lock/<task-id>` in the lock repo; its tree is exactly one file, `status.json`; each commit's message is a title for people (naming the PR as `owner/repo#N` on reports, reviews and acceptances) and a last line of JSON with the event, which the audit replays | `tasks(id, rev, status)` and `events(seq, task, rev, event, at)` in SQLite |
 | `rev` | Tip commit SHA | Integer |
 | `snapshot()` | `git fetch lock '+refs/heads/task-lock/*:refs/remotes/lock/*'`, then `git cat-file --batch`. One round trip, incremental, not counted against the REST rate limit. | `GET /tasks` |
 | `submit` | Build a commit with parent = `rev` using plumbing (`hash-object`, `mktree`, `commit-tree`), then `git push --force-with-lease=<ref>:<rev> lock <commit>:<ref>`, where `<ref>` is `refs/heads/task-lock/<task-id>` | See endpoints below; the server runs `step` inside one transaction |

@@ -123,8 +123,8 @@ def test_archive_keeps_history_reachable(world):
     assert a.delete("x", r.snap.rev)
     log = git("log", "--format=%H", "refs/heads/archive", cwd=world.lock_repo).splitlines()
     assert r.snap.rev in log
-    msg = json.loads(git("log", "-1", "--format=%B", "refs/heads/archive", cwd=world.lock_repo))
-    assert msg["archive"] == "x"
+    body = git("log", "-1", "--format=%B", "refs/heads/archive", cwd=world.lock_repo)
+    assert body.splitlines()[0] == "archive x" and json.loads(body.splitlines()[-1])["archive"] == "x"
 
 
 def test_review_flow_and_self_review(world):
@@ -138,3 +138,25 @@ def test_review_flow_and_self_review(world):
     assert r2.snap.status.core.need is Need.MERGE and r2.snap.status.last["reviewed_sha"] == "abc"
     assert b.audit(r2.snap.rev) == []
     assert isinstance(Snap("x", None, Status.initial("x")), Snap)
+
+
+def test_commit_titles_for_people_and_json_for_the_audit(world):
+    from afe_fleet.model import Accept
+    w, r, admin = lock(world, "alice/box"), lock(world, "bob"), lock(world, "admin")
+    pr = {"repo": "org/code", "number": 7}
+    s = w.submit(w.read("x"), Claim("alice/box", 0)).snap
+    s = w.submit(s, Heartbeat("alice/box", 1)).snap
+    s = w.submit(s, Report("alice/box", 1, Outcome("success", pr))).snap
+    s = r.submit(r.read("x"), Claim("bob", 1)).snap
+    s = r.submit(s, Review("bob", 2, Verdict.APPROVE)).snap
+    s = admin.submit(admin.read("x"), Accept()).snap
+    subjects = git("log", "--reverse", "--format=%s", s.rev, cwd=world.lock_repo).splitlines()
+    assert subjects == ["alice/box started work on x (epoch 1)", "alice/box is still on x",
+                        "alice/box finished x: org/code#7", "bob started reviewing x: org/code#7",
+                        "bob approved x: org/code#7", "admin accepted x: org/code#7"]
+    assert admin.audit(s.rev) == []
+    # commits from before titles (the JSON alone) still audit
+    from afe_fleet.status import apply
+    old = admin.commit(apply(Status.initial("y"), Claim("a", 0)), None, admin.message(Claim("a", 0)))
+    assert admin.git("log", "-1", "--format=%B", old).startswith("{")
+    assert admin.audit(old) == []

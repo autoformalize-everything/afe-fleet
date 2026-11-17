@@ -1,6 +1,15 @@
 """GitHub mode: the lock repo. One branch per task in flight, `task-lock/<task-id>`.
 
-Each commit's tree is exactly `status.json`; its message is JSON naming the event. Every write
+Each commit's tree is exactly `status.json`. Its message is a title for people, then a blank
+line and one line of JSON naming the event, which is what `audit` replays (older commits have
+the JSON alone):
+
+    imlvts/corey-codex finished bzip2/spec/huffman: autoformalize-everything/afe-oss#10
+
+    {"by": "imlvts/corey-codex", "event": {"report": ...}, "nonce": "..."}
+
+Titles of reports, reviews and acceptances name the pull request as `owner/repo#N`, so GitHub
+links it and lists the commit on the pull request's timeline. Every write
 is a compare-and-swap: `git push --force-with-lease=<ref>:<expected>`, with an empty expected
 value meaning "create only". A missing branch is a task nobody has claimed (`Status.initial`).
 Plain fast-forward pushes are never used: once branches are deleted, they would let a zombie
@@ -17,10 +26,53 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gitutil import Git, GitError
-from .model import Event, event_from_json, event_to_json, step
+from .model import (PARTIAL, SUCCESS, Accept, Cancel, Claim, Event, Expire, Heartbeat, Need, Report, Review,
+                    Rework, Verdict, event_from_json, event_to_json, step)
 from .status import Status, apply
 
 log = logging.getLogger(__name__)
+
+
+def pr_ref(pr: object) -> str | None:
+    """`owner/repo#N`, which GitHub links (and lists on the pull request's timeline)."""
+    if isinstance(pr, dict) and pr.get("repo") and pr.get("number"):
+        return f"{pr['repo']}#{pr['number']}"
+    return None
+
+
+def title(task: str, before: Status, ev: Event, after: Status, who: str) -> str:
+    """One line saying what the commit does, for people reading the lock repo's history."""
+    pr = pr_ref(after.core.pr) or pr_ref(before.core.pr)
+    on_pr = f": {pr}" if pr else ""
+    match ev:
+        case Claim(w, e):
+            if before.core.need is Need.REVIEW:
+                return f"{w} started reviewing {task}{on_pr}"
+            verb = "resumed work on" if before.core.pr is not None else "started work on"
+            return f"{w} {verb} {task} (epoch {e + 1})"
+        case Heartbeat(w, _):
+            return f"{w} is still on {task}"
+        case Report(w, _, o):
+            if o.kind == SUCCESS:
+                return f"{w} finished {task}{on_pr}"
+            if o.kind == PARTIAL:
+                return f"{w} made progress on {task}{on_pr}"
+            return f"{w} failed on {task} (strike {after.core.strikes})"
+        case Review(w, _, v):
+            if v is Verdict.APPROVE:
+                return f"{w} approved {task}{on_pr}"
+            if v is Verdict.CHANGES:
+                return f"{w} asked for changes to {task}{on_pr}"
+            return f"{w} abstained from reviewing {task}"
+        case Expire(e):
+            return f"{task}: the lease of epoch {e} expired ({who})"
+        case Accept():
+            return f"{who} accepted {task}{on_pr}"
+        case Rework():
+            return f"{who} sent {task} back for work"
+        case Cancel():
+            return f"{who} cancelled {task}"
+    return f"{who}: {type(ev).__name__.lower()} on {task}"
 
 
 @dataclass(frozen=True)
@@ -126,11 +178,12 @@ class LockRepo:
 
     # -- writes ------------------------------------------------------------------------------
 
-    def commit(self, status: Status, parent: str | None, message: dict) -> str:
+    def commit(self, status: Status, parent: str | None, message: dict, title: str = "") -> str:
         blob = self.git("hash-object", "-w", "--stdin", input=status.dumps())
         tree = self.git("mktree", input=f"100644 blob {blob}\tstatus.json\n")
         parents = ["-p", parent] if parent else []
-        return self.git("commit-tree", tree, *parents, "-m", json.dumps(message, sort_keys=True))
+        body = json.dumps(message, sort_keys=True)
+        return self.git("commit-tree", tree, *parents, "-m", f"{title}\n\n{body}" if title else body)
 
     def push(self, updates: list[Upd]) -> list[bool]:
         """One round trip; per update, whether the remote accepted it."""
@@ -192,7 +245,8 @@ class LockRepo:
         new = apply(snap.status, ev, meta=meta, last=last)
         if new is None:
             return None
-        return Snap(snap.task, self.commit(new, snap.rev, self.message(ev)), new)
+        return Snap(snap.task, self.commit(new, snap.rev, self.message(ev),
+                                           title(snap.task, snap.status, ev, new, self.who)), new)
 
     def submit(self, snap: Snap, ev: Event, *, meta: dict | None = None,
                last: dict | None = None) -> Submitted:
@@ -225,7 +279,7 @@ class LockRepo:
                     return cur
             empty = self.git("mktree", input="")
             parents = (["-p", cur] if cur else []) + ["-p", tip]
-            msg = json.dumps({"archive": task, "tip": tip, "by": self.who}, sort_keys=True)
+            msg = f"archive {task}\n\n" + json.dumps({"archive": task, "tip": tip, "by": self.who}, sort_keys=True)
             sha = self.git("commit-tree", empty, *parents, "-m", msg)
             if self.push([Upd(ref, cur, sha)])[0]:
                 return sha
@@ -255,7 +309,7 @@ class LockRepo:
             if prev is None:
                 prev = Status.initial(st.task)
             try:
-                ev = event_from_json(json.loads(body)["event"])
+                ev = event_from_json(json.loads(body.strip().splitlines()[-1])["event"])
             except (ValueError, KeyError, TypeError) as e:
                 bad.append(f"{where}: no event in commit message: {e}")
                 prev = st
