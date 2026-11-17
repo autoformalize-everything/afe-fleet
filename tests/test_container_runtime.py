@@ -63,6 +63,9 @@ def test_container_agent_runs_on_the_host_with_the_plugin(tmp_path):
     assert "--network" not in args  # docker's default network unless configured
     with_net = Runtime(AgentConfig(runtime="container", network="none"), "img:1", "n", "l")._container_args(ws, "n")
     assert with_net[with_net.index("--network") + 1] == "none"
+    assert "--cpus" not in args  # no CPU cap unless configured
+    capped = Runtime(AgentConfig(runtime="container", cpus=8), "img:1", "n", "l")._container_args(ws, "n")
+    assert capped[capped.index("--cpus") + 1] == "8"
 
     vargv, vcwd = rt.verify_argv(ws, ["make", "check"])
     assert vargv[:3] == ["docker", "run", "--rm"] and vargv[-3:] == ["img:1", "make", "check"]

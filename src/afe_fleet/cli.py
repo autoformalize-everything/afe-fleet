@@ -256,6 +256,49 @@ def cmd_timeline(args) -> int:
     return 0
 
 
+# -- fuzz --------------------------------------------------------------------------------------
+
+def cmd_fuzz(args) -> int:
+    import threading
+
+    from .admin import Admin
+    from .fuzz import Runner, load_campaigns
+    loaded = load(args.source)
+    home = fleet_home(loaded.fleet.name) / "fuzz"
+    try:
+        held = hold_lock(home / "lock", f"the fuzz runner of fleet {loaded.fleet.name}")  # noqa: F841
+    except AlreadyRunning as e:
+        log.error("%s", e)
+        return 75
+
+    def cancel(task: str, reason: str):
+        return Admin(loaded, _admin_coord(loaded, "fuzz-lock.git"), None).cancel(task, reason=reason)
+
+    events = EventLog(fleet_home(loaded.fleet.name) / "events", "fuzz")
+    runner = Runner(loaded.config, home, cancel=cancel, events=events.bind("fuzz"))
+    campaigns = load_campaigns(loaded.config, loaded.config.fetch())
+    wanted = set(args.campaign or [])
+    chosen = [c for c in campaigns if not wanted or c.key in wanted or c.name in wanted]
+    if not chosen:
+        raise ValueError(f"no campaign{' named ' + ', '.join(sorted(wanted)) if wanted else 's'} in the config repo "
+                         f"(tasks/<project>/fuzz.toml); there are: {', '.join(c.key for c in campaigns) or 'none'}")
+    if args.import_dir:
+        for c in chosen:
+            print(f"{c.key}: imported {runner.import_corpus(c, Path(args.import_dir))} corpus files")
+    if args.once:
+        for c in chosen:
+            for a in runner.round(c):
+                print(f"{c.key}: {a}")
+        return 0
+    stop = threading.Event()
+    log.info("fuzz runner for %s", ", ".join(c.key for c in chosen))
+    try:
+        runner.run_forever(stop, {c.key for c in chosen})
+    except KeyboardInterrupt:
+        stop.set()
+    return 0
+
+
 # -- status ------------------------------------------------------------------------------------
 
 def cmd_status(args) -> int:
@@ -359,6 +402,14 @@ def parser() -> argparse.ArgumentParser:
     tl.add_argument("--until", help="up to this time")
     tl.add_argument("-o", "--output", default="afe-fleet-trace.json", help="where to write the Chrome trace")
 
+    fz = sub.add_parser("fuzz", help="fuzz campaigns without a model, filing findings as tasks (fuzz.py)")
+    fz.add_argument("action", choices=["run"])
+    fz.add_argument("source")
+    fz.add_argument("--campaign", action="append", help="only this campaign (name or project/name); repeatable")
+    fz.add_argument("--once", action="store_true", help="one round of each campaign now, then exit")
+    fz.add_argument("--import", dest="import_dir", metavar="DIR",
+                    help="first add the files under DIR to the campaigns' corpora")
+
     tr = sub.add_parser("trace", help="record every process run in the fleet's containers into the event log "
                                       "(bpftrace; run with sudo)")
     tr.add_argument("--fleet", help="the fleet's name (default: the only fleet on this host)")
@@ -390,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.verbose)
     try:
         return {"worker": cmd_worker, "admin": cmd_admin, "server": cmd_server, "status": cmd_status,
-                "timeline": cmd_timeline, "trace": cmd_trace, "service": cmd_service}[args.cmd](args)
+                "timeline": cmd_timeline, "trace": cmd_trace, "fuzz": cmd_fuzz, "service": cmd_service}[args.cmd](args)
     except (ValueError, FileNotFoundError, RuntimeError) as e:
         log.error("%s", e)
         return 2

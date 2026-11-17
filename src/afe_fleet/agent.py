@@ -173,6 +173,8 @@ class Runtime:
                 "--security-opt", "no-new-privileges", "-w", str(ws.work), "-e", f"HOME={ws.home}"]
         if self.cfg.network:
             args += ["--network", self.cfg.network]
+        if self.cfg.cpus:
+            args += ["--cpus", f"{self.cfg.cpus:g}"]
         mounts = [f"{ws.work}:{ws.work}", f"{ws.task}:{ws.task}:ro", f"{ws.out}:{ws.out}", f"{ws.home}:{ws.home}"]
         common = _git_common_dir(ws.work)
         if common is not None and not common.is_relative_to(ws.work):

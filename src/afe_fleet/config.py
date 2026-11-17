@@ -175,6 +175,7 @@ class AgentConfig:
     env: dict[str, str] = field(default_factory=dict)
     docker_args: list[str] = field(default_factory=list)
     network: str = ""  # container runtime: --network of the attempt's container ("": docker's default)
+    cpus: float = 0  # container runtimes: docker --cpus, a hard cap on the attempt's CPU use; 0: none
     plugin_dir: str = ""  # container runtime: the container-tools plugin (default: the one shipped here)
     codex_exec_server: str = ""  # container runtime, codex: static exec-server binary (default: next to codex)
     usage_command: list[str] = field(default_factory=list)  # prints the CLI's usage JSON (capacity.py)
@@ -234,6 +235,8 @@ class HostConfig:
         for k in ("max_wall", "stall"):
             if k in a:
                 setattr(agent, k, parse_duration(a[k]))
+        if "cpus" in a:
+            agent.cpus = _positive(a["cpus"], f"{path}: [agent] cpus") or 0
         host = HostConfig(
             worker_id=overrides.get("worker_id") or w.get("id") or default_id, gh_user=gh_user,
             slots=int(overrides.get("slots") or w.get("slots", 1)),

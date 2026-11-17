@@ -267,6 +267,25 @@ error, like a container that cannot start. One use: point a project's package di
 prebuilt, read-only copy baked into the image instead of downloading it per attempt. `--dangerously-skip-permissions` is not
 needed in this mode: the plugin allows the contained tools itself.
 
+**CPU.** `cpus = 8` in `[agent]` caps each attempt's container at 8 CPUs (`docker run
+--cpus`), whatever the agent starts in it: a fuzzer with `-fork=32` or a parallel build shares
+the machine with the other workers instead of taking it.
+
+### Fuzzing without a model
+
+`afe-fleet fuzz run SOURCE` runs the fuzz campaigns declared in `tasks/<project>/fuzz.toml`
+(see `src/afe_fleet/fuzz.py` for the format) round after round, with no agent: it builds the
+target on the project's base branch, in the project's image, fuzzes for a fixed time on a
+corpus that grows across rounds, minimizes each crash, and groups them by signature (a harness
+should print `AFE-FUZZ: <what disagreed>` before it aborts). Every new finding is committed to
+the config repo at once, under `tasks/<project>/fuzz-findings/<campaign>/<hash>/` with its
+input, so none is lost; at most `max_open` of them are tasks at a time, the rest wait their
+turn. Each round reruns the open findings on the base branch and cancels the task of one that
+stopped failing. Agents fix one finding per task; the runner keeps finding.
+
+    afe-fleet fuzz run autoformalize-everything/afe-tasks --once                 # one round now
+    afe-fleet fuzz run autoformalize-everything/afe-tasks --import ~/old-corpus  # seed the corpus first
+
 ### Codex as the agent
 
 ```toml
