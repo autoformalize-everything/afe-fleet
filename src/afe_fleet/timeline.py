@@ -12,8 +12,12 @@ A span still open at the end of the log (a running worker, or one that died) is 
 the worker's last event and marked `open`.
 
 With `sudo afe-fleet trace` running (trace.py), the log also has a `proc` span for every program
-run in the workers' containers. Each worker gets a group of tracks for them, one per process,
-beside its own row, and the summary adds the programs that took the most time.
+run in the workers' containers. Each worker gets a group of tracks for them beside its own row,
+packed into a few lanes (`lanes`): a child sits under its parent, as in a flame graph, and a
+lane is added only for processes that run side by side, so an hour of tens of thousands of
+processes takes a dozen or two tracks. The containers' own processes (init, keep-alive loop,
+Codex's exec server) are left out (`is_infra`). The summary adds the programs that took the
+most time.
 """
 
 from __future__ import annotations
@@ -91,11 +95,56 @@ def spans(events: Iterable[dict]) -> tuple[list[Span], list[dict]]:
             done.append(Span(w, name, b["t"], max(last_t.get(w, b["t"]), b["t"]), args, open=True))
     done.sort(key=lambda s: (s.start, -s.dur))
     owners = {s.args["container"]: s.w for s in done if s.name == "container-start" and s.args.get("container")}
+    infra: set[tuple[str, int]] = set()
     for s in done:  # a container's processes belong to the worker that started it
         if s.name == "proc":
             c = s.args.get("container", s.w)
-            s.w = owners.get(c) or owners.get(c.removesuffix("-verify")) or f"container {c}"
+            s.w = owners.get(c) or owners.get(c.removesuffix("-verify")) or "other containers"
+            if is_infra(s, (c, s.args.get("ppid")) in infra):
+                s.args["infra"] = True
+                if not str(s.args.get("cmd", "")).startswith("fork of "):  # a fork may exec real work
+                    infra.add((c, s.args.get("pid")))
     return done, instants
+
+
+INFRA_PROGRAMS = ("docker-init", "codex-exec-server")
+
+
+def is_infra(s: Span, parent_infra: bool) -> bool:
+    """The container's own processes, there for its whole life: the init, the keep-alive loop
+    (agent.KEEPALIVE) and its sleeps, Codex's exec server. Not what the agent ran."""
+    cmd = str(s.args.get("cmd", ""))
+    return (Path(cmd).name in INFRA_PROGRAMS or "sleep 3600 & wait" in str(s.args.get("args", ""))
+            or (parent_infra and (cmd.startswith("fork of ") or Path(cmd).name == "sleep")))
+
+
+def lanes(procs: list[Span]) -> list[int]:
+    """Packs one worker's processes into few tracks: each lane holds properly nested spans (a
+    stack), a child goes into its parent's lane when it fits under it, and a new lane opens only
+    for processes that really run side by side. Returns each span's lane, in input order."""
+    order = sorted(range(len(procs)), key=lambda i: (procs[i].start, -procs[i].dur))
+    stacks: list[list[float]] = []  # per lane, the ends of the open spans, innermost last
+    lane_of_pid: dict[object, int] = {}
+    out = [0] * len(procs)
+
+    def fits(k: int, s: Span) -> bool:
+        st = stacks[k]
+        while st and st[-1] <= s.start:
+            st.pop()
+        return not st or s.end <= st[-1]
+
+    for i in order:
+        s = procs[i]
+        parent = lane_of_pid.get(s.args.get("ppid"))
+        k = parent if parent is not None and fits(parent, s) else next(
+            (k for k in range(len(stacks)) if fits(k, s)), None)
+        if k is None:
+            stacks.append([])
+            k = len(stacks) - 1
+        stacks[k].append(s.end)
+        lane_of_pid[s.args.get("pid")] = k
+        out[i] = k
+    return out
 
 
 def label(s: Span) -> str:
@@ -109,7 +158,9 @@ def label(s: Span) -> str:
     if s.name == "turn":
         return "turn"
     if s.name == "proc":
-        return (a.get("args") or a.get("cmd") or "?")[:120]
+        name = Path(str(a.get("cmd") or "?").removeprefix("fork of ")).name
+        args = str(a.get("args") or "")
+        return (args if args.split(" ", 1)[0].endswith(name) else f"{name}: {args}")[:120]
     return s.name
 
 
@@ -119,20 +170,24 @@ def chrome_trace(all_spans: list[Span], instants: list[dict]) -> dict:
     tid = {w: i + 1 for i, w in enumerate(workers)}
     ev = [{"ph": "M", "name": "process_name", "pid": 1, "args": {"name": "afe-fleet"}}]
     ev += [{"ph": "M", "name": "thread_name", "pid": 1, "tid": tid[w], "args": {"name": w}} for w in workers]
-    procs = sorted({s.w for s in all_spans if s.name == "proc"})
-    group = {w: i + 2 for i, w in enumerate(procs)}  # a trace "process" per worker, a track per OS process
-    ev += [{"ph": "M", "name": "process_name", "pid": group[w], "args": {"name": f"{w}: processes"}} for w in procs]
-    named: set[tuple[int, int]] = set()
+    # a trace "process" per worker for what ran in its containers, packed into a few lanes
+    by_worker: dict[str, list[Span]] = defaultdict(list)
+    for s in all_spans:
+        if s.name == "proc" and not s.args.get("infra"):
+            by_worker[s.w].append(s)
+    for g, (w, ps) in enumerate(sorted(by_worker.items()), start=2):
+        lane = lanes(ps)
+        n = max(lane) + 1
+        ev.append({"ph": "M", "name": "process_name", "pid": g, "args": {"name": f"{w}: processes"}})
+        ev += [{"ph": "M", "name": "thread_name", "pid": g, "tid": k + 1, "args": {"name": f"lane {k + 1}"}}
+               for k in range(n)]
+        for s, k in zip(ps, lane):
+            ts = round(s.start * 1e6)  # start and end rounded alike, so nesting survives rounding
+            ev.append({"ph": "X", "name": label(s), "cat": "proc", "pid": g, "tid": k + 1,
+                       "ts": ts, "dur": round(s.end * 1e6) - ts,
+                       "args": {**s.args, **({"open": True} if s.open else {})}})
     for s in all_spans:
         if s.name == "proc":
-            key = (group[s.w], int(s.args.get("pid", 0)))
-            if key not in named:
-                named.add(key)
-                ev.append({"ph": "M", "name": "thread_name", "pid": key[0], "tid": key[1],
-                           "args": {"name": f"{Path(str(s.args.get('cmd', '?'))).name} [{key[1]}]"}})
-            ev.append({"ph": "X", "name": label(s), "cat": "proc", "pid": key[0], "tid": key[1],
-                       "ts": round(s.start * 1e6), "dur": max(1, round(s.dur * 1e6)),
-                       "args": {**s.args, **({"open": True} if s.open else {})}})
             continue
         ev.append({"ph": "X", "name": label(s), "cat": s.name, "pid": 1, "tid": tid[s.w],
                    "ts": round(s.start * 1e6), "dur": max(1, round(s.dur * 1e6)),
@@ -198,7 +253,8 @@ def summary(all_spans: list[Span], instants: list[dict] | None = None) -> str:
             lines.append(f"  {name:20} {_fmt(sum(agg[name])):>8} in {len(agg[name])} calls")
         for s in sorted(tools, key=lambda s: -s.dur)[:8]:
             lines.append(f"  {_fmt(s.dur):>8}  {s.w}  {label(s)}")
-    procs = [s for s in all_spans if s.name == "proc" and not str(s.args.get("cmd", "")).startswith("fork of ")]
+    procs = [s for s in all_spans if s.name == "proc" and not s.args.get("infra")
+             and not str(s.args.get("cmd", "")).startswith("fork of ")]
     if procs:
         lines.append("\nPrograms in the containers (wall total, CPU total, runs, slowest run):")
         agg_p: dict[str, list[Span]] = defaultdict(list)

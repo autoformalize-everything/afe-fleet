@@ -91,13 +91,48 @@ def test_processes_in_the_timeline():
     ]
     spans, instants = timeline.spans(events)
     procs = {s.args["pid"]: s.w for s in spans if s.name == "proc"}
-    assert procs == {7: "alice/box-0", 8: "alice/box-0", 9: "container afe-fleet-y-0"}
+    assert procs == {7: "alice/box-0", 8: "alice/box-0", 9: "other containers"}
     trace = timeline.chrome_trace(spans, instants)["traceEvents"]
     groups = {e["args"]["name"] for e in trace if e["name"] == "process_name"}
     assert "alice/box-0: processes" in groups
     rows = {e["args"]["name"] for e in trace if e["name"] == "thread_name"}
-    assert "lake [7]" in rows and "alice/box-0" in rows and "afe-fleet-x-0" not in rows
+    assert "lane 1" in rows and "alice/box-0" in rows and "afe-fleet-x-0" not in rows
     text = timeline.summary(spans, instants)
     assert "lake" in text and "9.5s" in text and "2 program runs, 1 failed or killed" in text
     workers = text.split("\n\n")[0]
     assert "afe-fleet" not in workers  # containers are not workers
+
+
+def test_processes_pack_into_few_lanes():
+    from afe_fleet.timeline import Span, lanes
+
+    def p(pid, ppid, start, end):
+        return Span("w", "proc", start, end, {"pid": pid, "ppid": ppid, "cmd": "/bin/x"})
+    ps = [p(1, 0, 0, 100),  # a tool call's shell
+          p(2, 1, 10, 50), p(3, 1, 20, 60),  # two builds side by side under it
+          p(4, 2, 12, 15), p(5, 3, 21, 22),  # each runs a child: under its parent
+          p(6, 1, 70, 80),  # later, after both builds: back in the shell's lane
+          p(7, 0, 200, 210)]  # the next tool call reuses the first lane
+    got = dict(zip([s.args["pid"] for s in ps], lanes(ps)))
+    assert got[1] == got[2] == got[4] == got[6] == got[7] == 0
+    assert got[3] == got[5] == 1
+    assert max(got.values()) == 1
+
+
+def test_the_containers_own_processes_are_left_out():
+    keep = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
+    c = "afe-fleet-x-0"
+    events = [{"t": 1.0, "w": "a", "ph": "B", "span": "container-start", "container": c},
+              {"t": 1.5, "w": "a", "ph": "E", "span": "container-start"}]
+    for t, pid, ppid, cmd, args in [(2, 10, 0, "/sbin/docker-init", "/sbin/docker-init -- /bin/sh -c " + keep),
+                                    (2.1, 11, 10, "/bin/sh", "/bin/sh -c " + keep),
+                                    (2.2, 12, 11, "/bin/sleep", "sleep 3600"),
+                                    (3, 13, 0, "/opt/afe-fleet/codex-exec-server", "codex-exec-server"),
+                                    (4, 14, 13, "fork of /opt/afe-fleet/codex-exec-server", ""),
+                                    (4, 14, 13, "/usr/bin/bash", "bash -lc lake build"),
+                                    (5, 15, 14, "/usr/bin/lake", "lake build")]:
+        events.append({"t": t, "w": c, "ph": "X", "dur": 0.5, "span": "proc", "container": c, "pid": pid,
+                       "ppid": ppid, "cmd": cmd, "args": args})
+    spans, _ = timeline.spans(sorted(events, key=lambda e: e["t"]))
+    kept = sorted(s.args["pid"] for s in spans if s.name == "proc" and not s.args.get("infra"))
+    assert kept == [14, 15]  # the bash a tool call ran (not its fork) and what it ran
