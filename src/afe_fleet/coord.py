@@ -70,11 +70,18 @@ class Want:
 
 
 def _cooling(st: Status, now: float) -> bool:
-    """Advisory backoff after failures: min(5 min * 2^strikes, 6 h) since the last outcome."""
-    if not st.core.strikes or not st.last or "at" not in st.last:
+    """Advisory backoff after failures: min(5 min * 2^strikes, 6 h) since the last strike. Other
+    outcomes do not restart it: a review asking for changes is not a failure. (A status written
+    before `failed_at` existed counts from its last outcome, if that was the failure.)"""
+    if not st.core.strikes:
+        return False
+    when = st.failed_at
+    if when is None and st.last and st.last.get("outcome") in ("failure", "expired"):
+        when = st.last.get("at")
+    if not when:
         return False
     try:
-        at = datetime.strptime(st.last["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()
+        at = datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).timestamp()
     except ValueError:
         return False
     return now - at < min(300 * 2 ** st.core.strikes, 6 * 3600)
@@ -125,6 +132,7 @@ class Coord:
 
     patience: float = 3600
     sleep = staticmethod(time.sleep)
+    blocked: str | None = None  # after a claim found nothing: why, if known ("pr-limit")
 
     def claim(self, want: Want, meta: dict) -> Lease | None: ...
     def heartbeat(self, lease: Lease, meta: dict) -> None: ...
@@ -178,6 +186,13 @@ class GitCoord(Coord):
             if kind:
                 cands.append((rank(kind, snap.status, td), kind, td, snap))
         cands.sort(key=lambda c: c[0])
+        # why nothing could be claimed, for the worker's idle reason: the open-PR limit, when
+        # it is what kept new work back
+        self.blocked = None
+        if not cands and not new_work and any(
+                eligible(td, (snaps.get(tid) or Snap(tid, None, Status.initial(tid))).status, want,
+                         tree.done, now, tree.closed, True) for tid, td in tree.tasks.items()):
+            self.blocked = "pr-limit"
         for _, kind, td, snap in cands:
             m = {**meta, "spec_rev": tree.rev, "spec": td.spec, "kind": kind}
             res = self.lock.submit(snap, Claim(want.worker, snap.status.core.epoch), meta=m)

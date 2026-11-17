@@ -213,6 +213,8 @@ class Worker:
         self.usage = None  # capacity.Usage: the agent CLI's subscription usage, shared by the slots
         self._spare: bool | None = None
         self.events_log: EventLog | None = None  # the process's event log (events.py); None: none
+        # why the last claim found nothing: no-task, pr-limit (only the open-PR limit kept new work
+        # back), capacity (no spare subscription capacity), version, error; the idle span's reason
         self.idle_reason = "no-task"
         self._ev_attempt: Events | None = None
 
@@ -281,7 +283,7 @@ class Worker:
             if lease is not None:
                 end.update(task=lease.task, kind=lease.kind, epoch=lease.epoch)
         if lease is None:
-            self.idle_reason = "no-task"
+            self.idle_reason = getattr(self.coord, "blocked", None) or "no-task"
             return False
         log.info("claimed %s (%s, epoch %d)", lease.task, lease.kind, lease.epoch)
         self.journal.write(step="claimed", task=lease.task, epoch=lease.epoch, kind=lease.kind, nonce=nonce,

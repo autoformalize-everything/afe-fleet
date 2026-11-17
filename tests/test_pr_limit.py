@@ -59,3 +59,14 @@ def test_setting(tmp_path):
     p.write_text("[worker]\nmax_open_prs = 0\n")
     with pytest.raises(ValueError, match="max_open_prs"):
         HostConfig.load("f", p)
+
+
+def test_idle_reason_names_the_limit(world):
+    from conftest import FakeForge, edit_repo
+    from test_e2e import make_worker
+    forge = FakeForge()
+    alice = make_worker(world, "alice", "work", forge, max_open_prs=1)
+    assert alice.run_once()  # demo/a: her PR is now in review
+    assert not alice.run_once() and alice.idle_reason == "no-task"  # demo/b waits for demo/a: not the limit
+    edit_repo(world.config_repo, {"tasks/demo/c/TASK.md": "Write c.\n"})
+    assert not alice.run_once() and alice.idle_reason == "pr-limit"  # demo/c is there, but the limit holds it

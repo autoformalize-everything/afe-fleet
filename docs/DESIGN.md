@@ -43,6 +43,7 @@ stateDiagram-v2
 | `pr` | Latest PR. Survives failed attempts, so the next worker resumes from it. |
 | `author` | Who produced the PR under review. A reviewer must be someone else. |
 | `strikes` | Leases that ended without progress. Used only for backoff and escalation. |
+| `failed_at` | When the last strike was added. The backoff after failures, min(5 min × 2^strikes, 6 h), counts from it: a later success or review does not restart it. |
 
 | Event | Who | Guard | Effect |
 |---|---|---|---|

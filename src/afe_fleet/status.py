@@ -3,7 +3,8 @@
 Layout (docs/DESIGN.md section 3):
 
     {"v": 1, "task": "...", "need": ..., "epoch": ..., "lease": {"worker": ..., ...} | null,
-     "pr": {...} | null, "author": ..., "strikes": ..., "rounds": ..., "last": {...} | null}
+     "pr": {...} | null, "author": ..., "strikes": ..., "rounds": ..., "last": {...} | null,
+     "failed_at": "<UTC time of the last strike>"}  (absent before the first strike)
 
 `Core.lease` is `lease.worker`. Lease metadata (heartbeat time, note, spec, nonce) and `last`
 are payload: the model ignores them, the audit compares only `Core`.
@@ -31,6 +32,7 @@ class Status:
     lease: dict | None = None  # metadata; lease["worker"] == core.lease
     rounds: int = 0  # review rounds that ended in "changes"
     last: dict | None = None  # last outcome / verdict / expiry with debug info
+    failed_at: str | None = None  # when the last strike was added (a failure, an expired lease)
 
     def to_json(self) -> dict:
         c = self.core.to_json()
@@ -45,6 +47,7 @@ class Status:
             "strikes": c["strikes"],
             "rounds": self.rounds,
             "last": self.last,
+            **({"failed_at": self.failed_at} if self.failed_at else {}),
         }
 
     def dumps(self) -> str:
@@ -58,7 +61,7 @@ class Status:
         lease = j.get("lease")
         core = Core(Need(j["need"]), int(j["epoch"]), lease["worker"] if lease else None,
                     j.get("pr"), j.get("author"), int(j.get("strikes", 0)))
-        return Status(j["task"], core, lease, int(j.get("rounds", 0)), j.get("last"))
+        return Status(j["task"], core, lease, int(j.get("rounds", 0)), j.get("last"), j.get("failed_at"))
 
     @staticmethod
     def loads(s: str | bytes) -> Status:
@@ -92,4 +95,5 @@ def apply(s: Status, ev: Event, *, meta: dict | None = None, last: dict | None =
         new_last = {"epoch": s.core.epoch, "at": now_iso(), **last}
     if isinstance(ev, Heartbeat):
         new_last = s.last
-    return replace(s, core=core, lease=lease, rounds=rounds, last=new_last)
+    failed_at = now_iso() if core.strikes > s.core.strikes else s.failed_at
+    return replace(s, core=core, lease=lease, rounds=rounds, last=new_last, failed_at=failed_at)
